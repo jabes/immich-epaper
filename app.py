@@ -233,7 +233,15 @@ def _not_excluded(asset: dict) -> bool:
 
 def _orientation_ok(asset: dict) -> bool:
     """True if the asset matches IMMICH_ORIENTATION. 'any' always passes; 'square'
-    allows a small tolerance because real photos are rarely pixel-perfect square."""
+    allows a small tolerance because real photos are rarely pixel-perfect square.
+
+    NB: exifImageWidth/Height are the *sensor* dimensions, not the display ones.
+    A portrait phone photo is stored 4032x3024 (landscape sensor) with EXIF
+    Orientation tag = 6/8, meaning "rotate 90°/270° for display". Values 5-8 all
+    rotate by a quarter turn, so we have to swap W/H before classifying. Without
+    this, every portrait phone photo passes as "landscape" because its sensor
+    dims literally are.
+    """
     if ORIENTATION == "any":
         return True
     exif = asset.get("exifInfo") or {}
@@ -243,6 +251,13 @@ def _orientation_ok(asset: dict) -> bool:
         # being shown when the user asked for landscape, and there's almost always
         # plenty of other candidates in the batch.
         return False
+    # Orientation is stringly typed in Immich's response ("1".."8" or null).
+    try:
+        rot = int(exif.get("orientation") or 1)
+    except (TypeError, ValueError):
+        rot = 1
+    if rot in (5, 6, 7, 8):
+        w, h = h, w
     if ORIENTATION == "landscape":
         return w > h
     if ORIENTATION == "portrait":
