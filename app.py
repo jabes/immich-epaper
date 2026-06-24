@@ -28,6 +28,23 @@ Config via environment:
                    RGB image with no palette quantization, and /frame.bin uses
                    nearest-colour mapping without dither.
 
+  Layout — how the panel is mounted and whether to compose multiple assets:
+  IMMICH_DEVICE_ORIENTATION   landscape (default) | portrait
+                              Affects both the canvas dimensions and the duo layout
+                              direction: landscape = 800x480, two portraits placed
+                              side-by-side; portrait = 480x800, two landscapes
+                              stacked top/bottom.
+  IMMICH_DUO_PROBABILITY      0.0..1.0, default 0.5. Each refresh, this is the
+                              probability of composing two opposite-orientation
+                              assets into the frame instead of using one matching
+                              the device orientation. 0 disables duo entirely;
+                              1.0 forces duo every time.
+  IMMICH_ASSET_ORIENTATION    any | landscape | portrait | square. A manual
+                              override that filters every pick to assets of this
+                              shape. Default 'any', which lets the duo logic do
+                              its job. Set this only if you want to force "always
+                              landscape" or similar — it bypasses the duo logic.
+
   Kiosk-style filters (apply to the search path, i.e. when IMMICH_ALBUM_ID is unset;
   EXCLUDE_PEOPLE also applies in album mode):
   IMMICH_INCLUDE_PEOPLE     comma-separated person UUIDs to include
@@ -70,8 +87,13 @@ except Exception as e:  # pragma: no cover
 # panel's 4-bit colour code. Note the gap: 0x4 is unused on the E6 (it was
 # orange on the 7-colour "F" panel), so blue/green are 0x5/0x6.
 # ---------------------------------------------------------------------------
-WIDTH, HEIGHT = 800, 480
-FRAME_BYTES = WIDTH * HEIGHT // 2  # 192000
+PANEL_W, PANEL_H = 800, 480  # The panel itself is always landscape-native.
+FRAME_BYTES = PANEL_W * PANEL_H // 2  # 192000
+
+# WIDTH/HEIGHT are kept for legacy callers but track the *canvas* we compose to.
+# When DEVICE_ORIENTATION=portrait, the canvas is 480x800 and the final image is
+# rotated 90 degrees before packing so the panel still receives an 800x480 buffer.
+WIDTH, HEIGHT = PANEL_W, PANEL_H
 
 # RGB targets used for the nearest-colour mapping. These are deliberately a bit
 # muted vs pure primaries because the panel pigments are not saturated; tune
@@ -121,13 +143,46 @@ DATE_BEFORE = os.environ.get("IMMICH_DATE_BEFORE", "").strip()  # date, or "toda
 # How many candidates to pull per fetch so local exclusion + random pick have
 # something to work with (1..1000).
 SEARCH_BATCH = int(os.environ.get("IMMICH_SEARCH_BATCH", "250"))
-# any | landscape | portrait | square. Immich has no native orientation filter
-# (open feature request: discussions #19478 / #24216 / #9098), so we set
-# withExif and drop non-matching candidates locally before the random pick.
-ORIENTATION = os.environ.get("IMMICH_ORIENTATION", "any").strip().lower()
-if ORIENTATION not in {"any", "landscape", "portrait", "square"}:
+
+# Device orientation determines the canvas shape and the duo direction.
+DEVICE_ORIENTATION = (
+    os.environ.get("IMMICH_DEVICE_ORIENTATION", "landscape").strip().lower()
+)
+if DEVICE_ORIENTATION not in {"landscape", "portrait"}:
     raise SystemExit(
-        f"IMMICH_ORIENTATION={ORIENTATION!r} must be any|landscape|portrait|square"
+        f"IMMICH_DEVICE_ORIENTATION={DEVICE_ORIENTATION!r} must be landscape|portrait"
+    )
+
+# Canvas dimensions match the device orientation; we rotate at the end so the
+# panel always receives an 800x480 packed buffer.
+if DEVICE_ORIENTATION == "landscape":
+    CANVAS_W, CANVAS_H = PANEL_W, PANEL_H  # 800x480
+    SINGLE_SHAPE = "landscape"
+    DUO_SHAPE = "portrait"
+else:
+    CANVAS_W, CANVAS_H = PANEL_H, PANEL_W  # 480x800
+    SINGLE_SHAPE = "portrait"
+    DUO_SHAPE = "landscape"
+
+# Probability per refresh of composing two DUO_SHAPE assets instead of one
+# SINGLE_SHAPE asset. 0 disables the feature; 1.0 always composes a duo.
+try:
+    DUO_PROBABILITY = float(os.environ.get("IMMICH_DUO_PROBABILITY", "0.5"))
+except ValueError:
+    raise SystemExit("IMMICH_DUO_PROBABILITY must be a float between 0 and 1")
+if not 0.0 <= DUO_PROBABILITY <= 1.0:
+    raise SystemExit(
+        f"IMMICH_DUO_PROBABILITY={DUO_PROBABILITY} must be between 0 and 1"
+    )
+
+# Manual override that forces every pick to a single shape. 'any' (default)
+# lets the duo logic operate normally. Set to 'landscape' if you want to
+# disable portraits entirely, etc. Setting this to anything other than 'any'
+# effectively disables duo composition.
+ASSET_ORIENTATION = os.environ.get("IMMICH_ASSET_ORIENTATION", "any").strip().lower()
+if ASSET_ORIENTATION not in {"any", "landscape", "portrait", "square"}:
+    raise SystemExit(
+        f"IMMICH_ASSET_ORIENTATION={ASSET_ORIENTATION!r} must be any|landscape|portrait|square"
     )
 
 # center | smart. smart uses smartcrop.py (edge/saturation/skin heuristics) to
@@ -208,7 +263,12 @@ def _log_startup_config() -> None:
         ("IMMICH_DATE_AFTER", DATE_AFTER or "(unset)"),
         ("IMMICH_DATE_BEFORE", DATE_BEFORE or "(unset)"),
         ("IMMICH_SEARCH_BATCH", SEARCH_BATCH),
-        ("IMMICH_ORIENTATION", ORIENTATION),
+        (
+            "IMMICH_DEVICE_ORIENTATION",
+            f"{DEVICE_ORIENTATION} ({CANVAS_W}x{CANVAS_H} canvas)",
+        ),
+        ("IMMICH_DUO_PROBABILITY", DUO_PROBABILITY),
+        ("IMMICH_ASSET_ORIENTATION", ASSET_ORIENTATION),
         ("IMMICH_CROP", CROP_MODE),
         ("IMMICH_DITHER", DITHER_ENABLED),
         ("IMMICH_CACHE", CACHE_ENABLED),
@@ -249,11 +309,63 @@ def _build_palette_image() -> Image.Image:
 _PAL_IMG = _build_palette_image()
 
 
-def _center_fit(img: Image.Image) -> Image.Image:
-    """Cover-crop to exactly WIDTH x HEIGHT, centred. The fallback for both
+def _center_fit(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
+    """Cover-crop to exactly target_w x target_h, centred. The fallback for both
     smart-crop failure and as the default crop mode."""
     return ImageOps.fit(
-        img, (WIDTH, HEIGHT), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5)
+        img, (target_w, target_h), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5)
+    )
+
+
+def _smart_fit(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
+    """target_w x target_h crop chosen by smartcrop.py, then resampled.
+
+    Falls back to center-fit on any failure (source too small, smartcrop error)
+    so a bad image can never wedge the whole pipeline.
+    """
+    if img.width < target_w or img.height < target_h:
+        log.info(
+            "crop: source %dx%d smaller than %dx%d, falling back to center",
+            img.width,
+            img.height,
+            target_w,
+            target_h,
+        )
+        return _center_fit(img, target_w, target_h)
+    try:
+        assert _SMARTCROP is not None
+        scale = min(1.0, 1024 / max(img.width, img.height))
+        if scale < 1.0:
+            scored = img.resize(
+                (int(img.width * scale), int(img.height * scale)),
+                Image.Resampling.LANCZOS,
+            )
+        else:
+            scored = img
+        result = _SMARTCROP.crop(scored, target_w, target_h)
+        c = result["top_crop"]
+        x, y, w, h = c["x"], c["y"], c["width"], c["height"]
+        inv = 1.0 / scale
+        box = (int(x * inv), int(y * inv), int((x + w) * inv), int((y + h) * inv))
+        cropped = img.crop(box)
+        log.info(
+            "crop: smart picked %s -> %dx%d from %dx%d",
+            box,
+            target_w,
+            target_h,
+            img.width,
+            img.height,
+        )
+        return cropped.resize((target_w, target_h), Image.Resampling.LANCZOS)
+    except Exception as e:
+        log.warning("crop: smartcrop failed (%s), falling back to center", e)
+        return _center_fit(img, target_w, target_h)
+
+
+def _fit_to_slot(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
+    """Apply the configured crop mode at the requested slot dimensions."""
+    return (_smart_fit if CROP_MODE == "smart" else _center_fit)(
+        img, target_w, target_h
     )
 
 
@@ -266,40 +378,49 @@ def _not_excluded(asset: dict) -> bool:
     return True
 
 
-def _orientation_ok(asset: dict) -> bool:
-    """True if the asset matches IMMICH_ORIENTATION. 'any' always passes; 'square'
-    allows a small tolerance because real photos are rarely pixel-perfect square.
+def _asset_display_dims(asset: dict) -> tuple[int, int] | None:
+    """Return (display_width, display_height) for an asset, accounting for EXIF
+    orientation. Returns None if EXIF dims are missing.
 
-    NB: exifImageWidth/Height are the *sensor* dimensions, not the display ones.
-    A portrait phone photo is stored 4032x3024 (landscape sensor) with EXIF
-    Orientation tag = 6/8, meaning "rotate 90°/270° for display". Values 5-8 all
-    rotate by a quarter turn, so we have to swap W/H before classifying. Without
-    this, every portrait phone photo passes as "landscape" because its sensor
-    dims literally are.
+    NB: exifImageWidth/Height are the *sensor* dimensions. A portrait phone photo
+    is stored 4032x3024 (landscape sensor) with EXIF Orientation tag = 6/8,
+    meaning "rotate 90°/270° for display". Values 5-8 all rotate by a quarter
+    turn, so we have to swap W/H to get the display dims.
     """
-    if ORIENTATION == "any":
-        return True
     exif = asset.get("exifInfo") or {}
     w, h = exif.get("exifImageWidth"), exif.get("exifImageHeight")
     if not w or not h:
-        # No EXIF dims -> can't classify. Drop it; it's safer than risking a portrait
-        # being shown when the user asked for landscape, and there's almost always
-        # plenty of other candidates in the batch.
-        return False
-    # Orientation is stringly typed in Immich's response ("1".."8" or null).
+        return None
     try:
         rot = int(exif.get("orientation") or 1)
     except (TypeError, ValueError):
         rot = 1
     if rot in (5, 6, 7, 8):
         w, h = h, w
-    if ORIENTATION == "landscape":
-        return w > h
-    if ORIENTATION == "portrait":
-        return h > w
-    # square
+    return (w, h)
+
+
+def _asset_shape(asset: dict) -> str | None:
+    """Return one of 'landscape' | 'portrait' | 'square', or None if unclassifiable."""
+    dims = _asset_display_dims(asset)
+    if dims is None:
+        return None
+    w, h = dims
     longer, shorter = max(w, h), min(w, h)
-    return (longer / shorter) <= 1.05
+    if longer / shorter <= 1.05:
+        return "square"
+    return "landscape" if w > h else "portrait"
+
+
+def _shape_matches(asset: dict, target: str) -> bool:
+    """True if asset matches target shape. Assets without EXIF dims are dropped
+    when target is anything other than 'any' — safer than guessing wrong."""
+    if target == "any":
+        return True
+    shape = _asset_shape(asset)
+    if shape is None:
+        return False  # no EXIF dims, refuse to classify
+    return shape == target
 
 
 def _search_body() -> dict:
@@ -309,8 +430,9 @@ def _search_body() -> dict:
         "withArchived": False,
         # needed so we can apply exclude_people locally
         "withPeople": bool(EXCLUDE_PEOPLE),
-        # needed so we can filter by orientation locally (exifImageWidth/Height)
-        "withExif": ORIENTATION != "any",
+        # Always request EXIF: even when ASSET_ORIENTATION='any', the duo picker
+        # needs display dims to classify candidates.
+        "withExif": True,
     }
     if DATE_AFTER:
         body["takenAfter"] = _iso(DATE_AFTER, end_of_day=False)
@@ -324,37 +446,59 @@ def _search_body() -> dict:
     return body
 
 
-def _pick_asset_id() -> str:
+def _pick_asset(shape: str, exclude_ids: set[str] | None = None) -> dict:
+    """Pick one asset matching the requested shape ('landscape'/'portrait'/'square'/'any').
+
+    Returns the full asset dict (so the caller has the id, filename, exif, etc).
+    exclude_ids is honoured to prevent picking the same asset twice in a duo
+    composition.
+
+    Honours ASSET_ORIENTATION as an additional filter: if it's set to something
+    other than 'any', the picked asset must satisfy BOTH the requested shape AND
+    the configured override. In practice setting ASSET_ORIENTATION makes duo
+    layouts impossible — by design, it's the "force single shape" escape hatch.
+    """
+    exclude_ids = exclude_ids or set()
+
+    def _shape_filter(a: dict) -> bool:
+        if not _shape_matches(a, shape):
+            return False
+        # Manual override: AND with shape.
+        if ASSET_ORIENTATION != "any" and not _shape_matches(a, ASSET_ORIENTATION):
+            return False
+        return True
+
     if ALBUM_ID:
         r = requests.get(
             f"{IMMICH_URL}/api/albums/{ALBUM_ID}", headers=HEADERS, timeout=30
         )
         r.raise_for_status()
         raw = [a for a in r.json().get("assets", []) if a.get("type") == "IMAGE"]
-        after_excl = [a for a in raw if _not_excluded(a)]
-        assets = [a for a in after_excl if _orientation_ok(a)]
+        after_excl = [a for a in raw if _not_excluded(a) and a["id"] not in exclude_ids]
+        assets = [a for a in after_excl if _shape_filter(a)]
         log.info(
-            "pick: album mode, %d images, %d after exclusion, %d after orientation=%s",
+            "pick(%s): album mode, %d images, %d after exclusion, %d after shape",
+            shape,
             len(raw),
             len(after_excl),
             len(assets),
-            ORIENTATION,
         )
         if not assets:
-            raise RuntimeError("album has no matching image assets")
-        a = random.choice(assets)
-        chosen = a["id"]
+            raise RuntimeError(f"album has no matching {shape} assets")
+        chosen = random.choice(assets)
         log.info(
-            "pick: chose %s (%s)  %s/photos/%s",
-            chosen,
-            a.get("originalFileName", "?"),
+            "pick(%s): chose %s (%s) %s  %s/photos/%s",
+            shape,
+            chosen["id"],
+            chosen.get("originalFileName", "?"),
+            _asset_display_dims(chosen),
             IMMICH_PUBLIC_URL,
-            chosen,
+            chosen["id"],
         )
         return chosen
 
     body = _search_body()
-    log.info("pick: search/random body=%s", body)
+    log.info("pick(%s): search/random body=%s", shape, body)
     r = requests.post(
         f"{IMMICH_URL}/api/search/random",
         headers={**HEADERS, "Content-Type": "application/json"},
@@ -363,30 +507,28 @@ def _pick_asset_id() -> str:
     )
     r.raise_for_status()
     data = r.json()
-    # current API returns a bare list; tolerate the paged shape too
     raw = data if isinstance(data, list) else data.get("assets", {}).get("items", [])
-    # Defensively drop non-IMAGE assets even though `type: IMAGE` is in the body,
-    # matching the album-mode behaviour. Cheap insurance against future API drift.
     raw = [a for a in raw if a.get("type") == "IMAGE"]
-    after_excl = [a for a in raw if _not_excluded(a)]
-    assets = [a for a in after_excl if _orientation_ok(a)]
+    after_excl = [a for a in raw if _not_excluded(a) and a["id"] not in exclude_ids]
+    assets = [a for a in after_excl if _shape_filter(a)]
     log.info(
-        "pick: search returned %d, %d after exclusion, %d after orientation=%s",
+        "pick(%s): search returned %d, %d after exclusion, %d after shape",
+        shape,
         len(raw),
         len(after_excl),
         len(assets),
-        ORIENTATION,
     )
     if not assets:
-        raise RuntimeError("no assets matched the configured filters")
-    a = random.choice(assets)
-    chosen = a["id"]
+        raise RuntimeError(f"no {shape} assets matched the configured filters")
+    chosen = random.choice(assets)
     log.info(
-        "pick: chose %s (%s)  %s/photos/%s",
-        chosen,
-        a.get("originalFileName", "?"),
+        "pick(%s): chose %s (%s) %s  %s/photos/%s",
+        shape,
+        chosen["id"],
+        chosen.get("originalFileName", "?"),
+        _asset_display_dims(chosen),
         IMMICH_PUBLIC_URL,
-        chosen,
+        chosen["id"],
     )
     return chosen
 
@@ -414,51 +556,60 @@ def _fetch_image(asset_id: str) -> Image.Image:
     return img
 
 
-def _smart_fit(img: Image.Image) -> Image.Image:
-    """800x480 crop chosen by smartcrop.py, then resampled to the target.
+def _normalize_source(img: Image.Image) -> Image.Image:
+    """Apply EXIF transpose and convert to RGB. Always do this before any
+    geometric work so per-photo rotation is honoured."""
+    img = ImageOps.exif_transpose(img) or img
+    return img.convert("RGB")
 
-    Returns a center-fit on any failure (source too small, smartcrop error) so
-    a bad image can never wedge the whole pipeline.
+
+def _pick_layout() -> str:
+    """Decide whether this refresh is a 'single' (one SINGLE_SHAPE asset) or
+    'duo' (two DUO_SHAPE assets composed)."""
+    if DUO_PROBABILITY <= 0.0 or ASSET_ORIENTATION != "any":
+        # Forced single: either duo is disabled, or the manual override is on
+        # (and would make duo impossible anyway).
+        return "single"
+    if DUO_PROBABILITY >= 1.0:
+        return "duo"
+    return "duo" if random.random() < DUO_PROBABILITY else "single"
+
+
+def _compose_canvas(sources: list[Image.Image], layout: str) -> Image.Image:
+    """Build the final RGB canvas (CANVAS_W x CANVAS_H) before quantization.
+
+    layout='single': one source filling the entire canvas.
+    layout='duo': two sources split along the canvas's *long* axis. For a
+    landscape canvas (800x480), portraits sit side-by-side at 400x480 each.
+    For a portrait canvas (480x800), landscapes stack at 480x400 each.
     """
-    if img.width < WIDTH or img.height < HEIGHT:
-        log.info(
-            "crop: source %dx%d smaller than %dx%d, falling back to center",
-            img.width,
-            img.height,
-            WIDTH,
-            HEIGHT,
-        )
-        return _center_fit(img)
-    try:
-        assert _SMARTCROP is not None  # CROP_MODE validation guarantees this
-        # smartcrop scoring is content-blind to resolution but it's slow on huge
-        # images. Downscale the long edge to ~1024 before scoring; the chosen
-        # region scales linearly back to the full-res image, so quality of the
-        # final crop is unaffected.
-        scale = min(1.0, 1024 / max(img.width, img.height))
-        if scale < 1.0:
-            scored = img.resize(
-                (int(img.width * scale), int(img.height * scale)),
-                Image.Resampling.LANCZOS,
-            )
-        else:
-            scored = img
-        result = _SMARTCROP.crop(scored, WIDTH, HEIGHT)
-        c = result["top_crop"]
-        x, y, w, h = c["x"], c["y"], c["width"], c["height"]
-        # Map back to full-res coordinates.
-        inv = 1.0 / scale
-        box = (int(x * inv), int(y * inv), int((x + w) * inv), int((y + h) * inv))
-        cropped = img.crop(box)
-        log.info("crop: smart picked %s from %dx%d", box, img.width, img.height)
-        return cropped.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
-    except Exception as e:
-        log.warning("crop: smartcrop failed (%s), falling back to center", e)
-        return _center_fit(img)
+    canvas = Image.new("RGB", (CANVAS_W, CANVAS_H), (255, 255, 255))
+    if layout == "single":
+        assert len(sources) == 1
+        canvas.paste(_fit_to_slot(sources[0], CANVAS_W, CANVAS_H), (0, 0))
+        return canvas
+
+    assert layout == "duo" and len(sources) == 2
+    if DEVICE_ORIENTATION == "landscape":
+        # Two portrait slots side-by-side. Splitting 800 in two gives 400-wide
+        # slots; if you ever want a gap between, subtract a margin here.
+        slot_w, slot_h = CANVAS_W // 2, CANVAS_H
+        canvas.paste(_fit_to_slot(sources[0], slot_w, slot_h), (0, 0))
+        canvas.paste(_fit_to_slot(sources[1], slot_w, slot_h), (slot_w, 0))
+    else:
+        # Two landscape slots stacked vertically.
+        slot_w, slot_h = CANVAS_W, CANVAS_H // 2
+        canvas.paste(_fit_to_slot(sources[0], slot_w, slot_h), (0, 0))
+        canvas.paste(_fit_to_slot(sources[1], slot_w, slot_h), (0, slot_h))
+    return canvas
 
 
-def _process(img: Image.Image) -> tuple[bytes, bytes, bytes]:
+def _process(sources: list[Image.Image], layout: str) -> tuple[bytes, bytes, bytes]:
     """Return (packed_192000_bytes, png_bytes, jpg_bytes).
+
+    Takes the raw source images and a layout choice, composes them onto a canvas
+    matching the device orientation, then rotates to panel-native 800x480 if
+    needed, then quantizes/packs.
 
     DITHER_ENABLED controls quantization:
       true  -> Floyd-Steinberg dither to the 6-colour panel palette. Best
@@ -470,46 +621,44 @@ def _process(img: Image.Image) -> tuple[bytes, bytes, bytes]:
                firmware) handles dither.
     """
     t0 = time.monotonic()
-    # Split across two statements so Pylance can narrow the type: the stub for
-    # exif_transpose declares Image | None (because of its in-place overload),
-    # and `.convert` on None would warn. `or img` is a safe fallback if a
-    # future Pillow really does return None here.
-    img = ImageOps.exif_transpose(img) or img
-    img = img.convert("RGB")
+    sources = [_normalize_source(s) for s in sources]
+    canvas = _compose_canvas(sources, layout)
+
+    # FRAME_ROTATE applies to the final composed canvas (legacy behavior).
     if ROTATE in (90, 180, 270):
-        img = img.rotate(-ROTATE, expand=True)
-    img = _smart_fit(img) if CROP_MODE == "smart" else _center_fit(img)
+        canvas = canvas.rotate(-ROTATE, expand=True)
+
+    # If the device is portrait, the canvas is 480x800. The panel still wants
+    # 800x480 — so rotate 90° CCW so the top of the canvas becomes the left of
+    # the panel. (Mount the panel with its native bottom-edge on the right.)
+    if DEVICE_ORIENTATION == "portrait":
+        canvas = canvas.rotate(-90, expand=True)  # 480x800 -> 800x480
+
+    assert canvas.size == (PANEL_W, PANEL_H), (canvas.size, (PANEL_W, PANEL_H))
 
     if DITHER_ENABLED:
-        # Quantize to the panel palette with Floyd-Steinberg.
-        quant = img.quantize(palette=_PAL_IMG, dither=Image.Dither.FLOYDSTEINBERG)
+        quant = canvas.quantize(palette=_PAL_IMG, dither=Image.Dither.FLOYDSTEINBERG)
         preview_source = quant.convert("RGB")
     else:
-        # No dither. For the previews, serve the unmodified RGB crop so a
-        # downstream decoder gets the cleanest possible input. For the bin, we
-        # still have to map pixels to panel colour codes, so use nearest-colour
-        # with no dither (Dither.NONE).
-        quant = img.quantize(palette=_PAL_IMG, dither=Image.Dither.NONE)
-        preview_source = img  # original RGB crop, no quantization
+        quant = canvas.quantize(palette=_PAL_IMG, dither=Image.Dither.NONE)
+        preview_source = canvas
 
-    idx = np.asarray(quant, dtype=np.uint8)  # (480, 800), values 0..5
-    codes = CODE_LUT[idx]  # (480, 800), panel nibble codes
-    hi = codes[:, 0::2] << 4  # even columns -> high nibble
-    lo = codes[:, 1::2]  # odd columns  -> low nibble
-    packed = (hi | lo).astype(np.uint8).tobytes()  # row-major -> 192000 bytes
+    idx = np.asarray(quant, dtype=np.uint8)
+    codes = CODE_LUT[idx]
+    hi = codes[:, 0::2] << 4
+    lo = codes[:, 1::2]
+    packed = (hi | lo).astype(np.uint8).tobytes()
     assert len(packed) == FRAME_BYTES, len(packed)
 
     png_buf = io.BytesIO()
     preview_source.save(png_buf, format="PNG")
-
-    # JPEG is much smaller than PNG for photographic content, which matters for
-    # ESP32 clients with limited buffer space. quality=85 is the standard "good
-    # enough, small file" sweet spot; optimize squeezes a few more % off.
     jpg_buf = io.BytesIO()
     preview_source.save(jpg_buf, format="JPEG", quality=85, optimize=True)
 
     log.info(
-        "process: packed %d, png %d, jpg %d bytes, crop=%s, dither=%s, rotate=%s, %.0f ms",
+        "process: layout=%s sources=%d packed=%d png=%d jpg=%d, crop=%s, dither=%s, rotate=%s, %.0f ms",
+        layout,
+        len(sources),
         len(packed),
         len(png_buf.getvalue()),
         len(jpg_buf.getvalue()),
@@ -525,14 +674,49 @@ def _get_today(fresh: bool) -> dict:
     use_cache = CACHE_ENABLED and not fresh
     key = date.today().isoformat()
     if use_cache and key in _cache:
-        log.info("get: cache hit for %s (asset %s)", key, _cache[key]["id"])
+        log.info("get: cache hit for %s (assets %s)", key, _cache[key]["id"])
         return _cache[key]
     log.info("get: recomputing (cache=%s, fresh=%s)", CACHE_ENABLED, fresh)
-    asset_id = _pick_asset_id()
-    packed, png, jpg = _process(_fetch_image(asset_id))
-    entry = {"id": asset_id, "bin": packed, "png": png, "jpg": jpg}
+
+    layout = _pick_layout()
+    log.info(
+        "get: layout=%s (device=%s, duo_prob=%.2f)",
+        layout,
+        DEVICE_ORIENTATION,
+        DUO_PROBABILITY,
+    )
+
+    if layout == "duo":
+        # Pick two DUO_SHAPE assets, second one excluding the first to avoid
+        # showing the same photo twice.
+        a1 = _pick_asset(DUO_SHAPE)
+        try:
+            a2 = _pick_asset(DUO_SHAPE, exclude_ids={a1["id"]})
+        except RuntimeError as e:
+            # Not enough DUO_SHAPE assets in the pool to fill two slots. Fall
+            # back to a single SINGLE_SHAPE asset rather than failing the whole
+            # refresh.
+            log.warning("get: duo failed (%s), falling back to single", e)
+            layout = "single"
+            assets = [_pick_asset(SINGLE_SHAPE)]
+        else:
+            assets = [a1, a2]
+    else:
+        assets = [_pick_asset(SINGLE_SHAPE)]
+
+    sources = [_fetch_image(a["id"]) for a in assets]
+    packed, png, jpg = _process(sources, layout)
+    # Use a compound id so the cache header / log line reflects the duo.
+    composite_id = "+".join(a["id"] for a in assets)
+    entry = {
+        "id": composite_id,
+        "bin": packed,
+        "png": png,
+        "jpg": jpg,
+        "layout": layout,
+    }
     if use_cache:
-        _cache.clear()  # only keep the current day
+        _cache.clear()
         _cache[key] = entry
     return entry
 
