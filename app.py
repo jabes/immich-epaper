@@ -677,26 +677,28 @@ _brisque = BRISQUE(url=False)  # init once
 
 
 def _get_nima_score(img: Image.Image) -> float:
-    """Return NIMA aesthetic score (1-10) using pyiqa. Higher is better."""
     global _nima_model
     try:
         if _nima_model is None:
             _nima_model = pyiqa.create_metric("nima")
             log.info("pyiqa NIMA model loaded")
         score_tensor = _nima_model(img)
-        score = float(score_tensor.cpu().detach().numpy())
+        # Use .item() to get a Python scalar from a 0D tensor
+        score = score_tensor.cpu().detach().item()
         return max(1.0, min(10.0, score))
     except Exception as e:
         log.warning("NIMA scoring failed: %s", e)
-        return 5.0  # neutral fallback
+        return 5.0
 
 
 def _get_brisque_score(img: Image.Image) -> float:
-    """Return BRISQUE no‑reference quality score. Lower is better."""
     try:
-        # BRISQUE expects RGB numpy array in [0,1]
         arr = np.array(img, dtype=np.float64) / 255.0
-        return float(_brisque.score(arr))
+        score = _brisque.score(arr)
+        # If score is a numpy array, extract the scalar
+        if isinstance(score, np.ndarray):
+            return float(score.item())
+        return float(score)
     except Exception as e:
         log.warning("BRISQUE scoring failed: %s", e)
         return 50.0
