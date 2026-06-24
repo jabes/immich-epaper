@@ -76,7 +76,6 @@ import numpy as np
 # Quality scoring libraries – assumed available at build time
 import pyiqa
 import requests
-from brisque import BRISQUE
 from flask import Flask, Response, request
 from PIL import Image, ImageOps
 
@@ -670,10 +669,10 @@ def _process(sources: list[Image.Image], layout: str) -> tuple[bytes, bytes, byt
 
 
 # ---------------------------------------------------------------------------
-# Quality scoring functions – using pyiqa for NIMA
+# Quality scoring functions – using pyiqa for both NIMA and BRISQUE
 # ---------------------------------------------------------------------------
-_nima_model = None  # lazy init
-_brisque = BRISQUE(url=False)  # init once
+_nima_model = None
+_brisque_model = None
 
 
 def _get_nima_score(img: Image.Image) -> float:
@@ -683,56 +682,34 @@ def _get_nima_score(img: Image.Image) -> float:
             _nima_model = pyiqa.create_metric("nima")
             log.info("pyiqa NIMA model loaded")
         score_tensor = _nima_model(img)
-        # Use .item() to get a Python scalar from a 0D tensor
         score = score_tensor.cpu().detach().item()
         return max(1.0, min(10.0, score))
     except Exception as e:
-        log.warning("NIMA scoring failed: %s", e)
+        log.warning(f"NIMA scoring failed: {e}")
         return 5.0
 
 
 def _get_brisque_score(img: Image.Image) -> float:
+    global _brisque_model
     try:
-        # Convert to float64 and normalise to [0,1]
-        arr = np.array(img, dtype=np.float64) / 255.0
-        # Ensure the array is C-contiguous (some libraries require this)
-        arr = np.ascontiguousarray(arr)
-        log.info(
-            f"BRISQUE input: shape={arr.shape}, dtype={arr.dtype}, "
-            f"contiguous={arr.flags.c_contiguous}, min={arr.min():.3f}, max={arr.max():.3f}"
-        )
-
-        score = _brisque.score(arr)
-        log.info(f"BRISQUE raw score: {score} (type: {type(score)})")
-
-        # Handle the return value
-        if isinstance(score, np.ndarray):
-            if score.size == 0:
-                return 50.0
-            # If it's a 0‑D or 1‑element array, use .item()
-            if score.ndim == 0 or score.size == 1:
-                return float(score.item())
-            else:
-                # If it returns multiple values, take the first (shouldn't happen)
-                log.warning(
-                    f"BRISQUE returned array with shape {score.shape}, using first element"
-                )
-                return float(score.flat[0])
-        else:
-            return float(score)
+        if _brisque_model is None:
+            _brisque_model = pyiqa.create_metric("brisque")
+            log.info("pyiqa BRISQUE model loaded")
+        score_tensor = _brisque_model(img)
+        score = score_tensor.cpu().detach().item()
+        return float(score)
     except Exception as e:
-        log.warning(f"BRISQUE scoring failed: {e} (type: {type(e)})")
+        log.warning(f"BRISQUE scoring failed: {e}")
         return 50.0
 
 
 def _get_sharpness_score(img: Image.Image) -> float:
-    """Return Laplacian variance (higher = sharper)."""
     try:
         gray = np.array(img.convert("L"), dtype=np.uint8)
         lap = cv2.Laplacian(gray, cv2.CV_64F)
         return float(lap.var())
     except Exception as e:
-        log.warning("Sharpness scoring failed: %s", e)
+        log.warning(f"Sharpness scoring failed: {e}")
         return 0.0
 
 
