@@ -1,13 +1,35 @@
 """
-Serve a pre-dithered, pre-packed framebuffer for a Waveshare 7.3" Spectra 6 (E6 / epd7in3e) panel, sourced from Immich.
+immich-epaper: serve a pre-dithered, pre-packed framebuffer for a
+Waveshare 7.3" Spectra 6 (E6 / epd7in3e) panel, sourced from Immich.
 
 Endpoints:
   GET /frame.bin   -> 192000 bytes, the exact buffer EPD_7IN3E_Display() wants
+                      (800x480, 4 bits/pixel, 2 pixels/byte, high nibble = left pixel)
   GET /frame.png   -> the same dithered image as PNG, for eyeballing in a browser
   GET /healthz     -> liveness
 
 Query params (both image endpoints):
   ?fresh=1         -> bypass the once-per-day cache and pick a new image now
+
+Config via environment:
+  IMMICH_URL       e.g. http://immich-server:2283   (no trailing /api)
+  IMMICH_API_KEY   key with at least asset.read (+ album.read if you use an album)
+  IMMICH_ALBUM_ID  optional; if set, pick randomly from this album instead of the
+                   whole library. This also sidesteps the server-side /search/random
+                   "same asset every call" caching bug seen in some Immich versions,
+                   because the random choice happens here.
+  FRAME_ROTATE     0|90|180|270, default 0 (rotate the final image before packing)
+
+  Kiosk-style filters (apply to the search path, i.e. when IMMICH_ALBUM_ID is unset;
+  EXCLUDE_PEOPLE also applies in album mode):
+  IMMICH_INCLUDE_PEOPLE     comma-separated person UUIDs to include
+  IMMICH_REQUIRE_ALL_PEOPLE true  -> asset must contain ALL of them (personIds is AND)
+                            false -> any of them (picks one at random per fetch)
+  IMMICH_EXCLUDE_PEOPLE    comma-separated person UUIDs to drop (filtered locally;
+                            Immich has no native exclude filter)
+  IMMICH_DATE_AFTER         e.g. 2021-01-01 (-> takenAfter)
+  IMMICH_DATE_BEFORE        e.g. 2024-12-31, or the literal "today" (-> takenBefore)
+  IMMICH_SEARCH_BATCH       candidates pulled per fetch for local filtering (default 250)
 """
 
 import io
@@ -23,6 +45,14 @@ import numpy as np
 import requests
 from flask import Flask, Response, request
 from PIL import Image, ImageOps
+
+try:
+    import smartcrop as _smartcrop  # type: ignore[import-not-found]
+
+    _SMARTCROP = _smartcrop.SmartCrop()
+except Exception:  # pragma: no cover
+    _smartcrop = None
+    _SMARTCROP = None
 
 # ---------------------------------------------------------------------------
 # Panel definition. These are the authoritative epd7in3e (E6) values.
@@ -44,7 +74,6 @@ PALETTE_RGB = [
     (45, 65, 170),  # blue
     (35, 130, 75),  # green
 ]
-
 CODE_LUT = np.array([0x0, 0x1, 0x2, 0x3, 0x5, 0x6], dtype=np.uint8)
 
 IMMICH_URL = os.environ.get("IMMICH_URL", "http://immich-server:2283").rstrip("/")
@@ -79,6 +108,17 @@ ORIENTATION = os.environ.get("IMMICH_ORIENTATION", "any").strip().lower()
 if ORIENTATION not in {"any", "landscape", "portrait", "square"}:
     raise SystemExit(
         f"IMMICH_ORIENTATION={ORIENTATION!r} must be any|landscape|portrait|square"
+    )
+
+# center | smart. smart uses smartcrop.py (edge/saturation/skin heuristics) to
+# pick the most "interesting" 800x480 window from the source, then falls back to
+# center-crop on any error or when the source is smaller than the target.
+CROP_MODE = os.environ.get("IMMICH_CROP", "center").strip().lower()
+if CROP_MODE not in {"center", "smart"}:
+    raise SystemExit(f"IMMICH_CROP={CROP_MODE!r} must be center|smart")
+if CROP_MODE == "smart" and _SMARTCROP is None:
+    raise SystemExit(
+        "IMMICH_CROP=smart requires the 'smartcrop' package (add it to requirements.txt)"
     )
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -116,6 +156,7 @@ def _log_startup_config() -> None:
         ("IMMICH_DATE_BEFORE", DATE_BEFORE or "(unset)"),
         ("IMMICH_SEARCH_BATCH", SEARCH_BATCH),
         ("IMMICH_ORIENTATION", ORIENTATION),
+        ("IMMICH_CROP", CROP_MODE),
         ("IMMICH_CACHE", CACHE_ENABLED),
         ("FRAME_ROTATE", ROTATE),
         ("LOG_LEVEL", LOG_LEVEL),
@@ -299,15 +340,70 @@ def _fetch_image(asset_id: str) -> Image.Image:
     return img
 
 
+def _smart_fit(img: Image.Image) -> Image.Image:
+    """800x480 crop chosen by smartcrop.py, then resampled to the target.
+
+    Returns a center-fit on any failure (source too small, smartcrop error) so
+    a bad image can never wedge the whole pipeline.
+    """
+    if img.width < WIDTH or img.height < HEIGHT:
+        log.info(
+            "crop: source %dx%d smaller than %dx%d, falling back to center",
+            img.width,
+            img.height,
+            WIDTH,
+            HEIGHT,
+        )
+        return ImageOps.fit(
+            img, (WIDTH, HEIGHT), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5)
+        )
+    try:
+        assert _SMARTCROP is not None  # CROP_MODE validation guarantees this
+        # smartcrop scoring is content-blind to resolution but it's slow on huge
+        # images. Downscale the long edge to ~1024 before scoring; the chosen
+        # region scales linearly back to the full-res image, so quality of the
+        # final crop is unaffected.
+        scale = min(1.0, 1024 / max(img.width, img.height))
+        if scale < 1.0:
+            scored = img.resize(
+                (int(img.width * scale), int(img.height * scale)),
+                Image.Resampling.LANCZOS,
+            )
+        else:
+            scored = img
+        result = _SMARTCROP.crop(scored, WIDTH, HEIGHT)
+        c = result["top_crop"]
+        x, y, w, h = c["x"], c["y"], c["width"], c["height"]
+        # Map back to full-res coordinates.
+        inv = 1.0 / scale
+        box = (int(x * inv), int(y * inv), int((x + w) * inv), int((y + h) * inv))
+        cropped = img.crop(box)
+        log.info("crop: smart picked %s from %dx%d", box, img.width, img.height)
+        return cropped.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+    except Exception as e:
+        log.warning("crop: smartcrop failed (%s), falling back to center", e)
+        return ImageOps.fit(
+            img, (WIDTH, HEIGHT), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5)
+        )
+
+
 def _process(img: Image.Image) -> tuple[bytes, bytes]:
     """Return (packed_192000_bytes, png_preview_bytes)."""
     t0 = time.monotonic()
+    # Split across two statements so Pylance can narrow the type: the stub for
+    # exif_transpose declares Image | None (because of its in-place overload),
+    # and `.convert` on None would warn. `or img` is a safe fallback if a
+    # future Pillow really does return None here.
     img = ImageOps.exif_transpose(img) or img
     img = img.convert("RGB")
     if ROTATE in (90, 180, 270):
         img = img.rotate(-ROTATE, expand=True)
-    # cover-crop to exactly 800x480
-    img = ImageOps.fit(img, (WIDTH, HEIGHT), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+    if CROP_MODE == "smart":
+        img = _smart_fit(img)
+    else:
+        img = ImageOps.fit(
+            img, (WIDTH, HEIGHT), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5)
+        )
 
     quant = img.quantize(palette=_PAL_IMG, dither=Image.Dither.FLOYDSTEINBERG)
 
@@ -321,8 +417,9 @@ def _process(img: Image.Image) -> tuple[bytes, bytes]:
     png_buf = io.BytesIO()
     quant.convert("RGB").save(png_buf, format="PNG")
     log.info(
-        "process: dithered+packed %d bytes, rotate=%s, %.0f ms",
+        "process: dithered+packed %d bytes, crop=%s, rotate=%s, %.0f ms",
         len(packed),
+        CROP_MODE,
         ROTATE,
         (time.monotonic() - t0) * 1000,
     )

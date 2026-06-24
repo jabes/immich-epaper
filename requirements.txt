@@ -3,3 +3,4 @@ pillow==11.1.0
 requests==2.32.3
 numpy==2.2.1
 gunicorn==23.0.0
+smartcrop==0.4.2
