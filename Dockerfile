@@ -1,3 +1,4 @@
+# ---- Builder stage ----
 FROM python:3.12-slim AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential python3-dev
 WORKDIR /build
@@ -6,7 +7,9 @@ RUN python -m venv /venv
 ENV PATH="/venv/bin:$PATH"
 RUN pip install --no-cache-dir -r requirements.txt
 
+# ---- Final stage ----
 FROM python:3.12-slim
+RUN apt-get update && apt-get install -y --no-install-recommends libxcb1 && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=builder /venv /venv
 COPY app.py .
