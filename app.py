@@ -5,7 +5,10 @@ Waveshare 7.3" Spectra 6 (E6 / epd7in3e) panel, sourced from Immich.
 Endpoints:
   GET /frame.bin   -> 192000 bytes, the exact buffer EPD_7IN3E_Display() wants
                       (800x480, 4 bits/pixel, 2 pixels/byte, high nibble = left pixel)
-  GET /frame.png   -> the same dithered image as PNG, for eyeballing in a browser
+  GET /frame.png   -> the same image as PNG, lossless. Best for visual inspection.
+  GET /frame.jpg   -> the same image as JPEG (quality 85). Much smaller than PNG;
+                      preferred for memory-constrained clients (e.g. the ESP32
+                      photoframe firmware in URL-fetch mode).
   GET /healthz     -> liveness
 
 Query params (both image endpoints):
@@ -19,6 +22,11 @@ Config via environment:
                    "same asset every call" caching bug seen in some Immich versions,
                    because the random choice happens here.
   FRAME_ROTATE     0|90|180|270, default 0 (rotate the final image before packing)
+  IMMICH_DITHER    true (default) | false. Set false if your client (e.g.
+                   aitjcize/esp32-photoframe firmware in URL-fetch mode) does its
+                   own dithering on-device. When false, /frame.png is the cropped
+                   RGB image with no palette quantization, and /frame.bin uses
+                   nearest-colour mapping without dither.
 
   Kiosk-style filters (apply to the search path, i.e. when IMMICH_ALBUM_ID is unset;
   EXCLUDE_PEOPLE also applies in album mode):
@@ -91,6 +99,10 @@ ROTATE = int(os.environ.get("FRAME_ROTATE", "0"))
 # Set IMMICH_CACHE=false to recompute (new random pick + fetch + dither) on every
 # request instead of serving one stable image per calendar day.
 CACHE_ENABLED = os.environ.get("IMMICH_CACHE", "true").lower() != "false"
+# Set IMMICH_DITHER=false when the client (e.g. aitjcize/esp32-photoframe)
+# applies its own dithering. The crop still happens server-side; what changes is
+# whether we quantize+dither to the 6-colour panel palette before serving.
+DITHER_ENABLED = os.environ.get("IMMICH_DITHER", "true").lower() != "false"
 
 
 def _csv_env(name: str) -> list[str]:
@@ -198,6 +210,7 @@ def _log_startup_config() -> None:
         ("IMMICH_SEARCH_BATCH", SEARCH_BATCH),
         ("IMMICH_ORIENTATION", ORIENTATION),
         ("IMMICH_CROP", CROP_MODE),
+        ("IMMICH_DITHER", DITHER_ENABLED),
         ("IMMICH_CACHE", CACHE_ENABLED),
         ("FRAME_ROTATE", ROTATE),
         ("LOG_LEVEL", LOG_LEVEL),
@@ -215,7 +228,7 @@ _log_startup_config()
 
 app = Flask(__name__)
 
-# date_str -> {"id": str, "bin": bytes, "png": bytes}
+# date_str -> {"id": str, "bin": bytes, "png": bytes, "jpg": bytes}
 # Keyed by UTC date (the container's clock is almost always UTC; the cache
 # would flip at local midnight if TZ is set, which is fine but not what callers
 # would intuit). The day boundary is mostly cosmetic — most consumers care about
@@ -444,8 +457,18 @@ def _smart_fit(img: Image.Image) -> Image.Image:
         return _center_fit(img)
 
 
-def _process(img: Image.Image) -> tuple[bytes, bytes]:
-    """Return (packed_192000_bytes, png_preview_bytes)."""
+def _process(img: Image.Image) -> tuple[bytes, bytes, bytes]:
+    """Return (packed_192000_bytes, png_bytes, jpg_bytes).
+
+    DITHER_ENABLED controls quantization:
+      true  -> Floyd-Steinberg dither to the 6-colour panel palette. Best
+               output when the consumer is the panel directly (/frame.bin)
+               or a client that won't re-process.
+      false -> /frame.png and /frame.jpg are the cropped RGB image (no
+               quantization at all), and /frame.bin uses nearest-colour
+               mapping with no dither. Use when the client (e.g. aitjcize
+               firmware) handles dither.
+    """
     t0 = time.monotonic()
     # Split across two statements so Pylance can narrow the type: the stub for
     # exif_transpose declares Image | None (because of its in-place overload),
@@ -457,7 +480,17 @@ def _process(img: Image.Image) -> tuple[bytes, bytes]:
         img = img.rotate(-ROTATE, expand=True)
     img = _smart_fit(img) if CROP_MODE == "smart" else _center_fit(img)
 
-    quant = img.quantize(palette=_PAL_IMG, dither=Image.Dither.FLOYDSTEINBERG)
+    if DITHER_ENABLED:
+        # Quantize to the panel palette with Floyd-Steinberg.
+        quant = img.quantize(palette=_PAL_IMG, dither=Image.Dither.FLOYDSTEINBERG)
+        preview_source = quant.convert("RGB")
+    else:
+        # No dither. For the previews, serve the unmodified RGB crop so a
+        # downstream decoder gets the cleanest possible input. For the bin, we
+        # still have to map pixels to panel colour codes, so use nearest-colour
+        # with no dither (Dither.NONE).
+        quant = img.quantize(palette=_PAL_IMG, dither=Image.Dither.NONE)
+        preview_source = img  # original RGB crop, no quantization
 
     idx = np.asarray(quant, dtype=np.uint8)  # (480, 800), values 0..5
     codes = CODE_LUT[idx]  # (480, 800), panel nibble codes
@@ -467,15 +500,25 @@ def _process(img: Image.Image) -> tuple[bytes, bytes]:
     assert len(packed) == FRAME_BYTES, len(packed)
 
     png_buf = io.BytesIO()
-    quant.convert("RGB").save(png_buf, format="PNG")
+    preview_source.save(png_buf, format="PNG")
+
+    # JPEG is much smaller than PNG for photographic content, which matters for
+    # ESP32 clients with limited buffer space. quality=85 is the standard "good
+    # enough, small file" sweet spot; optimize squeezes a few more % off.
+    jpg_buf = io.BytesIO()
+    preview_source.save(jpg_buf, format="JPEG", quality=85, optimize=True)
+
     log.info(
-        "process: dithered+packed %d bytes, crop=%s, rotate=%s, %.0f ms",
+        "process: packed %d, png %d, jpg %d bytes, crop=%s, dither=%s, rotate=%s, %.0f ms",
         len(packed),
+        len(png_buf.getvalue()),
+        len(jpg_buf.getvalue()),
         CROP_MODE,
+        DITHER_ENABLED,
         ROTATE,
         (time.monotonic() - t0) * 1000,
     )
-    return packed, png_buf.getvalue()
+    return packed, png_buf.getvalue(), jpg_buf.getvalue()
 
 
 def _get_today(fresh: bool) -> dict:
@@ -486,8 +529,8 @@ def _get_today(fresh: bool) -> dict:
         return _cache[key]
     log.info("get: recomputing (cache=%s, fresh=%s)", CACHE_ENABLED, fresh)
     asset_id = _pick_asset_id()
-    packed, png = _process(_fetch_image(asset_id))
-    entry = {"id": asset_id, "bin": packed, "png": png}
+    packed, png, jpg = _process(_fetch_image(asset_id))
+    entry = {"id": asset_id, "bin": packed, "png": png, "jpg": jpg}
     if use_cache:
         _cache.clear()  # only keep the current day
         _cache[key] = entry
@@ -541,6 +584,24 @@ def frame_png():
     return Response(
         entry["png"],
         mimetype="image/png",
+        headers=_no_store({"X-Immich-Asset-Id": entry["id"]}),
+    )
+
+
+@app.get("/frame.jpg")
+def frame_jpg():
+    fresh = request.args.get("fresh") == "1"
+    log.info("request: GET /frame.jpg from %s (fresh=%s)", request.remote_addr, fresh)
+    try:
+        entry = _get_today(fresh)
+    except Exception as e:
+        log.exception("frame.jpg failed: %s", e)
+        return Response(
+            f"frame generation failed: {e}\n", status=503, mimetype="text/plain"
+        )
+    return Response(
+        entry["jpg"],
+        mimetype="image/jpeg",
         headers=_no_store({"X-Immich-Asset-Id": entry["id"]}),
     )
 
