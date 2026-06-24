@@ -17,6 +17,10 @@ RUN pip install --no-cache-dir --upgrade pip setuptools "setuptools<82" wheel
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch torchvision
 RUN pip install --no-cache-dir -r requirements.txt
 
+# After pip install, preload models
+RUN python -c "import pyiqa; pyiqa.create_metric('nima');"
+RUN python -c "import pyiqa; pyiqa.create_metric('brisque');"
+
 RUN find /venv -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 
 
@@ -39,4 +43,4 @@ ENV PATH="/venv/bin:$PATH"
 ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8080
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--timeout", "120", "--capture-output", "--log-level", "info", "--access-logfile", "-", "--error-logfile", "-", "app:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--timeout", "300", "--capture-output", "--log-level", "info", "--access-logfile", "-", "--error-logfile", "-", "app:app"]
