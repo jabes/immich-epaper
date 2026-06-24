@@ -695,16 +695,27 @@ def _get_brisque_score(img: Image.Image) -> float:
     try:
         arr = np.array(img, dtype=np.float64) / 255.0
         score = _brisque.score(arr)
+
+        # Log the raw return value for debugging
+        log.info(f"BRISQUE raw return: type={type(score)}, value={score}")
+
         if isinstance(score, np.ndarray):
-            # If array is empty, return default
+            log.info(f"BRISQUE array shape={score.shape}, dtype={score.dtype}")
             if score.size == 0:
                 return 50.0
-            # Take the first element (if multiple)
-            return float(score.flat[0])
+            # Use .item() if it's a single-element array, else take first element
+            if score.size == 1:
+                return float(score.item())
+            else:
+                log.info(
+                    f"BRISQUE returned multiple values, using first: {score.flat[0]}"
+                )
+                return float(score.flat[0])
         else:
+            # Not an ndarray – try direct conversion
             return float(score)
     except Exception as e:
-        log.warning("BRISQUE scoring failed: %s", e)
+        log.warning(f"BRISQUE scoring failed: {e} (type: {type(e)})")
         return 50.0
 
 
