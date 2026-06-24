@@ -50,9 +50,11 @@ try:
     import smartcrop as _smartcrop  # type: ignore[import-not-found]
 
     _SMARTCROP = _smartcrop.SmartCrop()
-except Exception:  # pragma: no cover
+    _SMARTCROP_ERROR = None
+except Exception as e:  # pragma: no cover
     _smartcrop = None
     _SMARTCROP = None
+    _SMARTCROP_ERROR = e
 
 # ---------------------------------------------------------------------------
 # Panel definition. These are the authoritative epd7in3e (E6) values.
@@ -124,7 +126,7 @@ if CROP_MODE not in {"center", "smart"}:
     raise SystemExit(f"IMMICH_CROP={CROP_MODE!r} must be center|smart")
 if CROP_MODE == "smart" and _SMARTCROP is None:
     raise SystemExit(
-        "IMMICH_CROP=smart requires the 'smartcrop' package (add it to requirements.txt)"
+        f"IMMICH_CROP=smart but smartcrop import failed: {_SMARTCROP_ERROR!r}"
     )
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -146,7 +148,39 @@ if not log.handlers:
 # requests/urllib3 are noisy at DEBUG; keep them at WARNING unless explicitly wanted.
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
+# If smartcrop was wanted but failed to import, note it so a startup install
+# issue (vs an intentional absence) is debuggable from the logs.
+if _SMARTCROP is None and _SMARTCROP_ERROR is not None:
+    log.info(
+        "smartcrop unavailable (%r); IMMICH_CROP=smart will be rejected",
+        _SMARTCROP_ERROR,
+    )
+
 HEADERS = {"x-api-key": API_KEY, "Accept": "application/json"}
+
+
+def _iso(d: str, end_of_day: bool) -> str:
+    """Resolve a date spec to ISO-8601 Z.
+
+    Accepts: 'today'/'now' (current instant), 'yesterday', 'N days ago' / 'Nd',
+    a plain date ('2021-01-01'), or a full ISO string (passed through).
+    Relative day keywords anchor to the start of day (for *After*) or end of day
+    (for *Before*), per end_of_day.
+    """
+    s = d.strip().lower()
+    now = datetime.now(timezone.utc)
+    edge = "T23:59:59.999Z" if end_of_day else "T00:00:00.000Z"
+
+    if s in ("today", "now"):
+        return now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    if s == "yesterday":
+        return (now - timedelta(days=1)).strftime("%Y-%m-%d") + edge
+    m = re.fullmatch(r"(\d+)\s*d(?:ays?)?(?:\s*ago)?", s)
+    if m:
+        return (now - timedelta(days=int(m.group(1)))).strftime("%Y-%m-%d") + edge
+    if "T" in d:
+        return d
+    return d + edge
 
 
 def _log_startup_config() -> None:
@@ -177,35 +211,15 @@ def _log_startup_config() -> None:
         log.info("  -> takenBefore resolves to %s", _iso(DATE_BEFORE, end_of_day=True))
 
 
-def _iso(d: str, end_of_day: bool) -> str:
-    """Resolve a date spec to ISO-8601 Z.
-
-    Accepts: 'today'/'now' (current instant), 'yesterday', 'N days ago' / 'Nd',
-    a plain date ('2021-01-01'), or a full ISO string (passed through).
-    Relative day keywords anchor to the start of day (for *After*) or end of day
-    (for *Before*), per end_of_day.
-    """
-    s = d.strip().lower()
-    now = datetime.now(timezone.utc)
-    edge = "T23:59:59.999Z" if end_of_day else "T00:00:00.000Z"
-
-    if s in ("today", "now"):
-        return now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    if s == "yesterday":
-        return (now - timedelta(days=1)).strftime("%Y-%m-%d") + edge
-    m = re.fullmatch(r"(\d+)\s*d(?:ays?)?(?:\s*ago)?", s)
-    if m:
-        return (now - timedelta(days=int(m.group(1)))).strftime("%Y-%m-%d") + edge
-    if "T" in d:
-        return d
-    return d + edge
-
-
 _log_startup_config()
 
 app = Flask(__name__)
 
 # date_str -> {"id": str, "bin": bytes, "png": bytes}
+# Keyed by UTC date (the container's clock is almost always UTC; the cache
+# would flip at local midnight if TZ is set, which is fine but not what callers
+# would intuit). The day boundary is mostly cosmetic — most consumers care about
+# "the same image for one wake-up cycle", not strict calendar alignment.
 _cache: dict[str, dict] = {}
 
 
@@ -220,6 +234,14 @@ def _build_palette_image() -> Image.Image:
 
 
 _PAL_IMG = _build_palette_image()
+
+
+def _center_fit(img: Image.Image) -> Image.Image:
+    """Cover-crop to exactly WIDTH x HEIGHT, centred. The fallback for both
+    smart-crop failure and as the default crop mode."""
+    return ImageOps.fit(
+        img, (WIDTH, HEIGHT), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5)
+    )
 
 
 def _not_excluded(asset: dict) -> bool:
@@ -330,6 +352,9 @@ def _pick_asset_id() -> str:
     data = r.json()
     # current API returns a bare list; tolerate the paged shape too
     raw = data if isinstance(data, list) else data.get("assets", {}).get("items", [])
+    # Defensively drop non-IMAGE assets even though `type: IMAGE` is in the body,
+    # matching the album-mode behaviour. Cheap insurance against future API drift.
+    raw = [a for a in raw if a.get("type") == "IMAGE"]
     after_excl = [a for a in raw if _not_excluded(a)]
     assets = [a for a in after_excl if _orientation_ok(a)]
     log.info(
@@ -390,9 +415,7 @@ def _smart_fit(img: Image.Image) -> Image.Image:
             WIDTH,
             HEIGHT,
         )
-        return ImageOps.fit(
-            img, (WIDTH, HEIGHT), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5)
-        )
+        return _center_fit(img)
     try:
         assert _SMARTCROP is not None  # CROP_MODE validation guarantees this
         # smartcrop scoring is content-blind to resolution but it's slow on huge
@@ -418,9 +441,7 @@ def _smart_fit(img: Image.Image) -> Image.Image:
         return cropped.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
     except Exception as e:
         log.warning("crop: smartcrop failed (%s), falling back to center", e)
-        return ImageOps.fit(
-            img, (WIDTH, HEIGHT), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5)
-        )
+        return _center_fit(img)
 
 
 def _process(img: Image.Image) -> tuple[bytes, bytes]:
@@ -434,12 +455,7 @@ def _process(img: Image.Image) -> tuple[bytes, bytes]:
     img = img.convert("RGB")
     if ROTATE in (90, 180, 270):
         img = img.rotate(-ROTATE, expand=True)
-    if CROP_MODE == "smart":
-        img = _smart_fit(img)
-    else:
-        img = ImageOps.fit(
-            img, (WIDTH, HEIGHT), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5)
-        )
+    img = _smart_fit(img) if CROP_MODE == "smart" else _center_fit(img)
 
     quant = img.quantize(palette=_PAL_IMG, dither=Image.Dither.FLOYDSTEINBERG)
 
@@ -481,9 +497,8 @@ def _get_today(fresh: bool) -> dict:
 def _no_store(headers: dict) -> dict:
     # Stop the browser (and any intermediary) from serving a cached frame on
     # reload. The device path doesn't cache, but browsers will cache an image at
-    # a stable URL without this.
-    headers["Cache-Control"] = "no-store, max-age=0"
-    return headers
+    # a stable URL without this. Returns a new dict — does not mutate the input.
+    return {**headers, "Cache-Control": "no-store, max-age=0"}
 
 
 @app.get("/frame.bin")
