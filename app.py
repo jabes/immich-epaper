@@ -77,6 +77,12 @@ PALETTE_RGB = [
 CODE_LUT = np.array([0x0, 0x1, 0x2, 0x3, 0x5, 0x6], dtype=np.uint8)
 
 IMMICH_URL = os.environ.get("IMMICH_URL", "http://immich-server:2283").rstrip("/")
+# Used only for building human-clickable links in the logs (e.g. your public
+# https://immich.example.com). Falls back to IMMICH_URL, which is fine if you
+# also reach Immich at that address from a browser; not fine if IMMICH_URL is
+# the internal docker-network address (http://immich-server:2283), in which
+# case set this to whatever you type into your browser.
+IMMICH_PUBLIC_URL = os.environ.get("IMMICH_PUBLIC_URL", IMMICH_URL).rstrip("/")
 API_KEY = os.environ["IMMICH_API_KEY"]
 ALBUM_ID = os.environ.get("IMMICH_ALBUM_ID", "").strip()
 ROTATE = int(os.environ.get("FRAME_ROTATE", "0"))
@@ -147,6 +153,7 @@ def _log_startup_config() -> None:
     masked = f"set(len={len(API_KEY)})" if API_KEY else "(MISSING)"
     items = [
         ("IMMICH_URL", IMMICH_URL),
+        ("IMMICH_PUBLIC_URL", IMMICH_PUBLIC_URL),
         ("IMMICH_API_KEY", masked),
         ("IMMICH_ALBUM_ID", ALBUM_ID or "(unset -> library/search mode)"),
         ("IMMICH_INCLUDE_PEOPLE", INCLUDE_PEOPLE or "(none)"),
@@ -285,8 +292,15 @@ def _pick_asset_id() -> str:
         )
         if not assets:
             raise RuntimeError("album has no matching image assets")
-        chosen = random.choice(assets)["id"]
-        log.info("pick: chose asset %s", chosen)
+        a = random.choice(assets)
+        chosen = a["id"]
+        log.info(
+            "pick: chose %s (%s)  %s/photos/%s",
+            chosen,
+            a.get("originalFileName", "?"),
+            IMMICH_PUBLIC_URL,
+            chosen,
+        )
         return chosen
 
     body = _search_body()
@@ -312,8 +326,15 @@ def _pick_asset_id() -> str:
     )
     if not assets:
         raise RuntimeError("no assets matched the configured filters")
-    chosen = random.choice(assets)["id"]
-    log.info("pick: chose asset %s", chosen)
+    a = random.choice(assets)
+    chosen = a["id"]
+    log.info(
+        "pick: chose %s (%s)  %s/photos/%s",
+        chosen,
+        a.get("originalFileName", "?"),
+        IMMICH_PUBLIC_URL,
+        chosen,
+    )
     return chosen
 
 
