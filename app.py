@@ -302,11 +302,12 @@ def _fetch_image(asset_id: str) -> Image.Image:
 def _process(img: Image.Image) -> tuple[bytes, bytes]:
     """Return (packed_192000_bytes, png_preview_bytes)."""
     t0 = time.monotonic()
-    img = ImageOps.exif_transpose(img).convert("RGB")
+    img = ImageOps.exif_transpose(img) or img
+    img = img.convert("RGB")
     if ROTATE in (90, 180, 270):
         img = img.rotate(-ROTATE, expand=True)
     # cover-crop to exactly 800x480
-    img = ImageOps.fit(img, (WIDTH, HEIGHT), method=Image.LANCZOS, centering=(0.5, 0.5))
+    img = ImageOps.fit(img, (WIDTH, HEIGHT), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
 
     quant = img.quantize(palette=_PAL_IMG, dither=Image.Dither.FLOYDSTEINBERG)
 
