@@ -1,35 +1,13 @@
 """
-immich-epaper: serve a pre-dithered, pre-packed framebuffer for a
-Waveshare 7.3" Spectra 6 (E6 / epd7in3e) panel, sourced from Immich.
+Serve a pre-dithered, pre-packed framebuffer for a Waveshare 7.3" Spectra 6 (E6 / epd7in3e) panel, sourced from Immich.
 
 Endpoints:
   GET /frame.bin   -> 192000 bytes, the exact buffer EPD_7IN3E_Display() wants
-                      (800x480, 4 bits/pixel, 2 pixels/byte, high nibble = left pixel)
   GET /frame.png   -> the same dithered image as PNG, for eyeballing in a browser
   GET /healthz     -> liveness
 
 Query params (both image endpoints):
   ?fresh=1         -> bypass the once-per-day cache and pick a new image now
-
-Config via environment:
-  IMMICH_URL       e.g. http://immich-server:2283   (no trailing /api)
-  IMMICH_API_KEY   key with at least asset.read (+ album.read if you use an album)
-  IMMICH_ALBUM_ID  optional; if set, pick randomly from this album instead of the
-                   whole library. This also sidesteps the server-side /search/random
-                   "same asset every call" caching bug seen in some Immich versions,
-                   because the random choice happens here.
-  FRAME_ROTATE     0|90|180|270, default 0 (rotate the final image before packing)
-
-  Kiosk-style filters (apply to the search path, i.e. when IMMICH_ALBUM_ID is unset;
-  EXCLUDED_PEOPLE also applies in album mode):
-  IMMICH_INCLUDE_PEOPLE     comma-separated person UUIDs to include
-  IMMICH_REQUIRE_ALL_PEOPLE true  -> asset must contain ALL of them (personIds is AND)
-                            false -> any of them (picks one at random per fetch)
-  IMMICH_EXCLUDED_PEOPLE    comma-separated person UUIDs to drop (filtered locally;
-                            Immich has no native exclude filter)
-  IMMICH_DATE_AFTER         e.g. 2021-01-01 (-> takenAfter)
-  IMMICH_DATE_BEFORE        e.g. 2024-12-31, or the literal "today" (-> takenBefore)
-  IMMICH_SEARCH_BATCH       candidates pulled per fetch for local filtering (default 250)
 """
 
 import io
@@ -59,13 +37,14 @@ FRAME_BYTES = WIDTH * HEIGHT // 2  # 192000
 # muted vs pure primaries because the panel pigments are not saturated; tune
 # them against your actual unit by viewing /frame.png.
 PALETTE_RGB = [
-    (0,   0,   0),     # black
-    (255, 255, 255),   # white
-    (255, 243, 56),    # yellow
-    (191, 35,  35),    # red
-    (45,  65,  170),   # blue
-    (35,  130, 75),    # green
+    (0, 0, 0),  # black
+    (255, 255, 255),  # white
+    (255, 243, 56),  # yellow
+    (191, 35, 35),  # red
+    (45, 65, 170),  # blue
+    (35, 130, 75),  # green
 ]
+
 CODE_LUT = np.array([0x0, 0x1, 0x2, 0x3, 0x5, 0x6], dtype=np.uint8)
 
 IMMICH_URL = os.environ.get("IMMICH_URL", "http://immich-server:2283").rstrip("/")
@@ -83,10 +62,12 @@ def _csv_env(name: str) -> list[str]:
 
 # Kiosk-style filters (search/random path only; album mode is its own curation,
 # matching Kiosk's "filter_date only applies to people and random assets").
-PEOPLE = _csv_env("IMMICH_INCLUDE_PEOPLE")               # person UUIDs to include
-EXCLUDED_PEOPLE = set(_csv_env("IMMICH_EXCLUDED_PEOPLE"))  # person UUIDs to drop
-REQUIRE_ALL_PEOPLE = os.environ.get("IMMICH_REQUIRE_ALL_PEOPLE", "false").lower() == "true"
-DATE_AFTER = os.environ.get("IMMICH_DATE_AFTER", "").strip()   # e.g. 2021-01-01
+INCLUDE_PEOPLE = _csv_env("IMMICH_INCLUDE_PEOPLE")  # person UUIDs to include
+EXCLUDE_PEOPLE = set(_csv_env("IMMICH_EXCLUDE_PEOPLE"))  # person UUIDs to drop
+REQUIRE_ALL_PEOPLE = (
+    os.environ.get("IMMICH_REQUIRE_ALL_PEOPLE", "false").lower() == "true"
+)
+DATE_AFTER = os.environ.get("IMMICH_DATE_AFTER", "").strip()  # e.g. 2021-01-01
 DATE_BEFORE = os.environ.get("IMMICH_DATE_BEFORE", "").strip()  # date, or "today"
 # How many candidates to pull per fetch so local exclusion + random pick have
 # something to work with (1..1000).
@@ -96,7 +77,9 @@ SEARCH_BATCH = int(os.environ.get("IMMICH_SEARCH_BATCH", "250"))
 # withExif and drop non-matching candidates locally before the random pick.
 ORIENTATION = os.environ.get("IMMICH_ORIENTATION", "any").strip().lower()
 if ORIENTATION not in {"any", "landscape", "portrait", "square"}:
-    raise SystemExit(f"IMMICH_ORIENTATION={ORIENTATION!r} must be any|landscape|portrait|square")
+    raise SystemExit(
+        f"IMMICH_ORIENTATION={ORIENTATION!r} must be any|landscape|portrait|square"
+    )
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 _level = getattr(logging, LOG_LEVEL, logging.INFO)
@@ -126,9 +109,9 @@ def _log_startup_config() -> None:
         ("IMMICH_URL", IMMICH_URL),
         ("IMMICH_API_KEY", masked),
         ("IMMICH_ALBUM_ID", ALBUM_ID or "(unset -> library/search mode)"),
-        ("IMMICH_INCLUDE_PEOPLE", PEOPLE or "(none)"),
+        ("IMMICH_INCLUDE_PEOPLE", INCLUDE_PEOPLE or "(none)"),
         ("IMMICH_REQUIRE_ALL_PEOPLE", REQUIRE_ALL_PEOPLE),
-        ("IMMICH_EXCLUDED_PEOPLE", sorted(EXCLUDED_PEOPLE) or "(none)"),
+        ("IMMICH_EXCLUDE_PEOPLE", sorted(EXCLUDE_PEOPLE) or "(none)"),
         ("IMMICH_DATE_AFTER", DATE_AFTER or "(unset)"),
         ("IMMICH_DATE_BEFORE", DATE_BEFORE or "(unset)"),
         ("IMMICH_SEARCH_BATCH", SEARCH_BATCH),
@@ -192,10 +175,10 @@ _PAL_IMG = _build_palette_image()
 
 
 def _not_excluded(asset: dict) -> bool:
-    if not EXCLUDED_PEOPLE:
+    if not EXCLUDE_PEOPLE:
         return True
     for p in asset.get("people", []):
-        if p.get("id") in EXCLUDED_PEOPLE:
+        if p.get("id") in EXCLUDE_PEOPLE:
             return False
     return True
 
@@ -226,8 +209,8 @@ def _search_body() -> dict:
         "type": "IMAGE",
         "size": max(1, min(SEARCH_BATCH, 1000)),
         "withArchived": False,
-        # needed so we can apply excluded_people locally
-        "withPeople": bool(EXCLUDED_PEOPLE),
+        # needed so we can apply exclude_people locally
+        "withPeople": bool(EXCLUDE_PEOPLE),
         # needed so we can filter by orientation locally (exifImageWidth/Height)
         "withExif": ORIENTATION != "any",
     }
@@ -235,23 +218,30 @@ def _search_body() -> dict:
         body["takenAfter"] = _iso(DATE_AFTER, end_of_day=False)
     if DATE_BEFORE:
         body["takenBefore"] = _iso(DATE_BEFORE, end_of_day=True)
-    if PEOPLE:
+    if INCLUDE_PEOPLE:
         if REQUIRE_ALL_PEOPLE:
-            body["personIds"] = PEOPLE          # AND: asset must contain all
+            body["personIds"] = INCLUDE_PEOPLE  # AND: asset must contain all
         else:
-            body["personIds"] = [random.choice(PEOPLE)]  # OR: one per fetch
+            body["personIds"] = [random.choice(INCLUDE_PEOPLE)]  # OR: one per fetch
     return body
 
 
 def _pick_asset_id() -> str:
     if ALBUM_ID:
-        r = requests.get(f"{IMMICH_URL}/api/albums/{ALBUM_ID}", headers=HEADERS, timeout=30)
+        r = requests.get(
+            f"{IMMICH_URL}/api/albums/{ALBUM_ID}", headers=HEADERS, timeout=30
+        )
         r.raise_for_status()
         raw = [a for a in r.json().get("assets", []) if a.get("type") == "IMAGE"]
         after_excl = [a for a in raw if _not_excluded(a)]
         assets = [a for a in after_excl if _orientation_ok(a)]
-        log.info("pick: album mode, %d images, %d after exclusion, %d after orientation=%s",
-                 len(raw), len(after_excl), len(assets), ORIENTATION)
+        log.info(
+            "pick: album mode, %d images, %d after exclusion, %d after orientation=%s",
+            len(raw),
+            len(after_excl),
+            len(assets),
+            ORIENTATION,
+        )
         if not assets:
             raise RuntimeError("album has no matching image assets")
         chosen = random.choice(assets)["id"]
@@ -272,8 +262,13 @@ def _pick_asset_id() -> str:
     raw = data if isinstance(data, list) else data.get("assets", {}).get("items", [])
     after_excl = [a for a in raw if _not_excluded(a)]
     assets = [a for a in after_excl if _orientation_ok(a)]
-    log.info("pick: search returned %d, %d after exclusion, %d after orientation=%s",
-             len(raw), len(after_excl), len(assets), ORIENTATION)
+    log.info(
+        "pick: search returned %d, %d after exclusion, %d after orientation=%s",
+        len(raw),
+        len(after_excl),
+        len(assets),
+        ORIENTATION,
+    )
     if not assets:
         raise RuntimeError("no assets matched the configured filters")
     chosen = random.choice(assets)["id"]
@@ -293,9 +288,14 @@ def _fetch_image(asset_id: str) -> Image.Image:
     )
     r.raise_for_status()
     img = Image.open(io.BytesIO(r.content))
-    log.info("fetch: asset %s, %d bytes, %dx%d, %.0f ms",
-             asset_id, len(r.content), img.width, img.height,
-             (time.monotonic() - t0) * 1000)
+    log.info(
+        "fetch: asset %s, %d bytes, %dx%d, %.0f ms",
+        asset_id,
+        len(r.content),
+        img.width,
+        img.height,
+        (time.monotonic() - t0) * 1000,
+    )
     return img
 
 
@@ -310,17 +310,21 @@ def _process(img: Image.Image) -> tuple[bytes, bytes]:
 
     quant = img.quantize(palette=_PAL_IMG, dither=Image.Dither.FLOYDSTEINBERG)
 
-    idx = np.asarray(quant, dtype=np.uint8)          # (480, 800), values 0..5
-    codes = CODE_LUT[idx]                              # (480, 800), panel nibble codes
-    hi = codes[:, 0::2] << 4                           # even columns -> high nibble
-    lo = codes[:, 1::2]                                # odd columns  -> low nibble
-    packed = (hi | lo).astype(np.uint8).tobytes()      # row-major -> 192000 bytes
+    idx = np.asarray(quant, dtype=np.uint8)  # (480, 800), values 0..5
+    codes = CODE_LUT[idx]  # (480, 800), panel nibble codes
+    hi = codes[:, 0::2] << 4  # even columns -> high nibble
+    lo = codes[:, 1::2]  # odd columns  -> low nibble
+    packed = (hi | lo).astype(np.uint8).tobytes()  # row-major -> 192000 bytes
     assert len(packed) == FRAME_BYTES, len(packed)
 
     png_buf = io.BytesIO()
     quant.convert("RGB").save(png_buf, format="PNG")
-    log.info("process: dithered+packed %d bytes, rotate=%s, %.0f ms",
-             len(packed), ROTATE, (time.monotonic() - t0) * 1000)
+    log.info(
+        "process: dithered+packed %d bytes, rotate=%s, %.0f ms",
+        len(packed),
+        ROTATE,
+        (time.monotonic() - t0) * 1000,
+    )
     return packed, png_buf.getvalue()
 
 
@@ -335,7 +339,7 @@ def _get_today(fresh: bool) -> dict:
     packed, png = _process(_fetch_image(asset_id))
     entry = {"id": asset_id, "bin": packed, "png": png}
     if use_cache:
-        _cache.clear()          # only keep the current day
+        _cache.clear()  # only keep the current day
         _cache[key] = entry
     return entry
 
@@ -357,14 +361,20 @@ def frame_bin():
         entry = _get_today(fresh)
     except Exception as e:
         log.exception("frame.bin failed: %s", e)
-        return Response(f"frame generation failed: {e}\n", status=503, mimetype="text/plain")
-    log.info("request: served /frame.bin asset %s in %.0f ms",
-             entry["id"], (time.monotonic() - t0) * 1000)
+        return Response(
+            f"frame generation failed: {e}\n", status=503, mimetype="text/plain"
+        )
+    log.info(
+        "request: served /frame.bin asset %s in %.0f ms",
+        entry["id"],
+        (time.monotonic() - t0) * 1000,
+    )
     return Response(
         entry["bin"],
         mimetype="application/octet-stream",
-        headers=_no_store({"X-Immich-Asset-Id": entry["id"],
-                           "Content-Length": str(FRAME_BYTES)}),
+        headers=_no_store(
+            {"X-Immich-Asset-Id": entry["id"], "Content-Length": str(FRAME_BYTES)}
+        ),
     )
 
 
@@ -376,9 +386,14 @@ def frame_png():
         entry = _get_today(fresh)
     except Exception as e:
         log.exception("frame.png failed: %s", e)
-        return Response(f"frame generation failed: {e}\n", status=503, mimetype="text/plain")
-    return Response(entry["png"], mimetype="image/png",
-                    headers=_no_store({"X-Immich-Asset-Id": entry["id"]}))
+        return Response(
+            f"frame generation failed: {e}\n", status=503, mimetype="text/plain"
+        )
+    return Response(
+        entry["png"],
+        mimetype="image/png",
+        headers=_no_store({"X-Immich-Asset-Id": entry["id"]}),
+    )
 
 
 @app.get("/healthz")
