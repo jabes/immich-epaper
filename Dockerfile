@@ -1,7 +1,6 @@
 FROM python:3.12-slim
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade wheel setuptools pip
 RUN pip install --no-cache-dir --requirement requirements.txt
 ENV PYTHONUNBUFFERED=1
 COPY app.py .
