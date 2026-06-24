@@ -693,26 +693,32 @@ def _get_nima_score(img: Image.Image) -> float:
 
 def _get_brisque_score(img: Image.Image) -> float:
     try:
+        # Convert to float64 and normalise to [0,1]
         arr = np.array(img, dtype=np.float64) / 255.0
+        # Ensure the array is C-contiguous (some libraries require this)
+        arr = np.ascontiguousarray(arr)
+        log.info(
+            f"BRISQUE input: shape={arr.shape}, dtype={arr.dtype}, "
+            f"contiguous={arr.flags.c_contiguous}, min={arr.min():.3f}, max={arr.max():.3f}"
+        )
+
         score = _brisque.score(arr)
+        log.info(f"BRISQUE raw score: {score} (type: {type(score)})")
 
-        # Log the raw return value for debugging
-        log.info(f"BRISQUE raw return: type={type(score)}, value={score}")
-
+        # Handle the return value
         if isinstance(score, np.ndarray):
-            log.info(f"BRISQUE array shape={score.shape}, dtype={score.dtype}")
             if score.size == 0:
                 return 50.0
-            # Use .item() if it's a single-element array, else take first element
-            if score.size == 1:
+            # If it's a 0‑D or 1‑element array, use .item()
+            if score.ndim == 0 or score.size == 1:
                 return float(score.item())
             else:
-                log.info(
-                    f"BRISQUE returned multiple values, using first: {score.flat[0]}"
+                # If it returns multiple values, take the first (shouldn't happen)
+                log.warning(
+                    f"BRISQUE returned array with shape {score.shape}, using first element"
                 )
                 return float(score.flat[0])
         else:
-            # Not an ndarray – try direct conversion
             return float(score)
     except Exception as e:
         log.warning(f"BRISQUE scoring failed: {e} (type: {type(e)})")
