@@ -11,8 +11,8 @@ Endpoints:
                       photoframe firmware in URL-fetch mode).
   GET /healthz     -> liveness
 
-Query params (both image endpoints):
-  ?fresh=1         -> bypass the once-per-day cache and pick a new image now
+Every request picks fresh assets from Immich; rotation cadence (hourly, daily,
+etc) is the firmware's responsibility, not the server's.
 
 Config via environment:
   IMMICH_URL       e.g. http://immich-server:2283   (no trailing /api)
@@ -55,6 +55,10 @@ Config via environment:
   IMMICH_DATE_AFTER         e.g. 2021-01-01 (-> takenAfter)
   IMMICH_DATE_BEFORE        e.g. 2024-12-31, or the literal "today" (-> takenBefore)
   IMMICH_SEARCH_BATCH       candidates pulled per fetch for local filtering (default 250)
+
+  Quality ranking:
+  IMMICH_RANKING_BATCH      how many candidates to fetch and score per request (default 5)
+  IMMICH_QUALITY_ENABLED    true (default) | false. If false, picks randomly (no scoring).
 """
 
 import io
@@ -64,19 +68,25 @@ import random
 import re
 import sys
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
+import cv2
 import numpy as np
+
+# Quality scoring libraries – assumed available at build time
+import pyiqa
 import requests
+from brisque import BRISQUE
 from flask import Flask, Response, request
 from PIL import Image, ImageOps
 
+# smartcrop – optional (we keep the existing fallback)
 try:
-    import smartcrop as _smartcrop  # type: ignore[import-not-found]
+    import smartcrop as _smartcrop
 
     _SMARTCROP = _smartcrop.SmartCrop()
     _SMARTCROP_ERROR = None
-except Exception as e:  # pragma: no cover
+except Exception as e:
     _smartcrop = None
     _SMARTCROP = None
     _SMARTCROP_ERROR = e
@@ -118,9 +128,6 @@ IMMICH_PUBLIC_URL = os.environ.get("IMMICH_PUBLIC_URL", IMMICH_URL).rstrip("/")
 API_KEY = os.environ["IMMICH_API_KEY"]
 ALBUM_ID = os.environ.get("IMMICH_ALBUM_ID", "").strip()
 ROTATE = int(os.environ.get("FRAME_ROTATE", "0"))
-# Set IMMICH_CACHE=false to recompute (new random pick + fetch + dither) on every
-# request instead of serving one stable image per calendar day.
-CACHE_ENABLED = os.environ.get("IMMICH_CACHE", "true").lower() != "false"
 # Set IMMICH_DITHER=false when the client (e.g. aitjcize/esp32-photoframe)
 # applies its own dithering. The crop still happens server-side; what changes is
 # whether we quantize+dither to the 6-colour panel palette before serving.
@@ -196,6 +203,10 @@ if CROP_MODE == "smart" and _SMARTCROP is None:
         f"IMMICH_CROP=smart but smartcrop import failed: {_SMARTCROP_ERROR!r}"
     )
 
+# Quality ranking settings
+RANKING_BATCH = int(os.environ.get("IMMICH_RANKING_BATCH", "5"))
+QUALITY_ENABLED = os.environ.get("IMMICH_QUALITY_ENABLED", "true").lower() != "false"
+
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 _level = getattr(logging, LOG_LEVEL, logging.INFO)
 
@@ -222,6 +233,8 @@ if _SMARTCROP is None and _SMARTCROP_ERROR is not None:
         "smartcrop unavailable (%r); IMMICH_CROP=smart will be rejected",
         _SMARTCROP_ERROR,
     )
+
+log.info("Quality scoring enabled (pyiqa NIMA, BRISQUE, sharpness)")
 
 HEADERS = {"x-api-key": API_KEY, "Accept": "application/json"}
 
@@ -271,9 +284,10 @@ def _log_startup_config() -> None:
         ("IMMICH_ASSET_ORIENTATION", ASSET_ORIENTATION),
         ("IMMICH_CROP", CROP_MODE),
         ("IMMICH_DITHER", DITHER_ENABLED),
-        ("IMMICH_CACHE", CACHE_ENABLED),
         ("FRAME_ROTATE", ROTATE),
         ("LOG_LEVEL", LOG_LEVEL),
+        ("IMMICH_RANKING_BATCH", RANKING_BATCH),
+        ("IMMICH_QUALITY_ENABLED", QUALITY_ENABLED),
     ]
     log.info("starting immich-epaper, resolved config:")
     for k, v in items:
@@ -287,13 +301,6 @@ def _log_startup_config() -> None:
 _log_startup_config()
 
 app = Flask(__name__)
-
-# date_str -> {"id": str, "bin": bytes, "png": bytes, "jpg": bytes}
-# Keyed by UTC date (the container's clock is almost always UTC; the cache
-# would flip at local midnight if TZ is set, which is fine but not what callers
-# would intuit). The day boundary is mostly cosmetic — most consumers care about
-# "the same image for one wake-up cycle", not strict calendar alignment.
-_cache: dict[str, dict] = {}
 
 
 def _build_palette_image() -> Image.Image:
@@ -576,7 +583,7 @@ def _pick_layout() -> str:
 
 
 def _compose_canvas(sources: list[Image.Image], layout: str) -> Image.Image:
-    """Build the final RGB canvas (CANVAS_W x CANVAS_H) before quantization.
+    """Build the final RGB canvas (CANVAS_W x CANVAS_H) before rotation and quantization.
 
     layout='single': one source filling the entire canvas.
     layout='duo': two sources split along the canvas's *long* axis. For a
@@ -604,38 +611,20 @@ def _compose_canvas(sources: list[Image.Image], layout: str) -> Image.Image:
     return canvas
 
 
-def _process(sources: list[Image.Image], layout: str) -> tuple[bytes, bytes, bytes]:
-    """Return (packed_192000_bytes, png_bytes, jpg_bytes).
-
-    Takes the raw source images and a layout choice, composes them onto a canvas
-    matching the device orientation, then rotates to panel-native 800x480 if
-    needed, then quantizes/packs.
-
-    DITHER_ENABLED controls quantization:
-      true  -> Floyd-Steinberg dither to the 6-colour panel palette. Best
-               output when the consumer is the panel directly (/frame.bin)
-               or a client that won't re-process.
-      false -> /frame.png and /frame.jpg are the cropped RGB image (no
-               quantization at all), and /frame.bin uses nearest-colour
-               mapping with no dither. Use when the client (e.g. aitjcize
-               firmware) handles dither.
-    """
-    t0 = time.monotonic()
-    sources = [_normalize_source(s) for s in sources]
-    canvas = _compose_canvas(sources, layout)
-
-    # FRAME_ROTATE applies to the final composed canvas (legacy behavior).
+def _rotate_final_canvas(canvas: Image.Image) -> Image.Image:
+    """Apply FRAME_ROTATE and device‑orientation rotation to get the final
+    panel‑native 800x480 RGB canvas."""
     if ROTATE in (90, 180, 270):
         canvas = canvas.rotate(-ROTATE, expand=True)
-
-    # If the device is portrait, the canvas is 480x800. The panel still wants
-    # 800x480 — so rotate 90° CCW so the top of the canvas becomes the left of
-    # the panel. (Mount the panel with its native bottom-edge on the right.)
     if DEVICE_ORIENTATION == "portrait":
         canvas = canvas.rotate(-90, expand=True)  # 480x800 -> 800x480
-
     assert canvas.size == (PANEL_W, PANEL_H), (canvas.size, (PANEL_W, PANEL_H))
+    return canvas
 
+
+def _pack_canvas(canvas: Image.Image) -> tuple[bytes, bytes, bytes]:
+    """Quantize (with or without dither) and pack the canvas into the 192k buffer.
+    Also return PNG and JPEG of the preview source."""
     if DITHER_ENABLED:
         quant = canvas.quantize(palette=_PAL_IMG, dither=Image.Dither.FLOYDSTEINBERG)
         preview_source = quant.convert("RGB")
@@ -654,71 +643,193 @@ def _process(sources: list[Image.Image], layout: str) -> tuple[bytes, bytes, byt
     preview_source.save(png_buf, format="PNG")
     jpg_buf = io.BytesIO()
     preview_source.save(jpg_buf, format="JPEG", quality=85, optimize=True)
+    return packed, png_buf.getvalue(), jpg_buf.getvalue()
+
+
+def _process(sources: list[Image.Image], layout: str) -> tuple[bytes, bytes, bytes]:
+    """Legacy wrapper: compose, rotate, pack, and return (packed, png, jpg)."""
+    t0 = time.monotonic()
+    sources = [_normalize_source(s) for s in sources]
+    canvas = _compose_canvas(sources, layout)
+    canvas = _rotate_final_canvas(canvas)
+    packed, png, jpg = _pack_canvas(canvas)
 
     log.info(
         "process: layout=%s sources=%d packed=%d png=%d jpg=%d, crop=%s, dither=%s, rotate=%s, %.0f ms",
         layout,
         len(sources),
         len(packed),
-        len(png_buf.getvalue()),
-        len(jpg_buf.getvalue()),
+        len(png),
+        len(jpg),
         CROP_MODE,
         DITHER_ENABLED,
         ROTATE,
         (time.monotonic() - t0) * 1000,
     )
-    return packed, png_buf.getvalue(), jpg_buf.getvalue()
+    return packed, png, jpg
 
 
-def _get_today(fresh: bool) -> dict:
-    use_cache = CACHE_ENABLED and not fresh
-    key = date.today().isoformat()
-    if use_cache and key in _cache:
-        log.info("get: cache hit for %s (assets %s)", key, _cache[key]["id"])
-        return _cache[key]
-    log.info("get: recomputing (cache=%s, fresh=%s)", CACHE_ENABLED, fresh)
+# ---------------------------------------------------------------------------
+# Quality scoring functions – using pyiqa for NIMA
+# ---------------------------------------------------------------------------
+_nima_model = None  # lazy init
+_brisque = BRISQUE(url=False)  # init once
 
+
+def _get_nima_score(img: Image.Image) -> float:
+    """Return NIMA aesthetic score (1-10) using pyiqa. Higher is better."""
+    global _nima_model
+    try:
+        if _nima_model is None:
+            _nima_model = pyiqa.create_metric("nima")
+            log.info("pyiqa NIMA model loaded")
+        score_tensor = _nima_model(img)
+        score = float(score_tensor.cpu().detach().numpy())
+        return max(1.0, min(10.0, score))
+    except Exception as e:
+        log.warning("NIMA scoring failed: %s", e)
+        return 5.0  # neutral fallback
+
+
+def _get_brisque_score(img: Image.Image) -> float:
+    """Return BRISQUE no‑reference quality score. Lower is better."""
+    try:
+        # BRISQUE expects RGB numpy array in [0,1]
+        arr = np.array(img, dtype=np.float64) / 255.0
+        return float(_brisque.score(arr))
+    except Exception as e:
+        log.warning("BRISQUE scoring failed: %s", e)
+        return 50.0
+
+
+def _get_sharpness_score(img: Image.Image) -> float:
+    """Return Laplacian variance (higher = sharper)."""
+    try:
+        gray = np.array(img.convert("L"), dtype=np.uint8)
+        lap = cv2.Laplacian(gray, cv2.CV_64F)
+        return float(lap.var())
+    except Exception as e:
+        log.warning("Sharpness scoring failed: %s", e)
+        return 0.0
+
+
+def _composite_score(img: Image.Image) -> float:
+    """Return a normalised composite score in [0,1] (higher = better)."""
+    nima = _get_nima_score(img)  # ~5-8
+    brisque = _get_brisque_score(img)  # ~20-60
+    sharp = _get_sharpness_score(img)  # ~100-2000 for 800x480
+
+    # Normalise each
+    nima_norm = max(0.0, min(1.0, (nima - 1.0) / 9.0))  # 1-10 -> 0-1
+    brisque_norm = max(0.0, min(1.0, brisque / 100.0))  # assume 0-100
+    sharp_norm = max(0.0, min(1.0, sharp / 2000.0))  # cap at 2000
+
+    # Combine: NIMA and sharpness are positive, BRISQUE is negative
+    composite = nima_norm * 0.6 + sharp_norm * 0.3 - brisque_norm * 0.1
+    return max(0.0, min(1.0, composite))
+
+
+# ---------------------------------------------------------------------------
+# Main frame builder – with ranking
+# ---------------------------------------------------------------------------
+def _build_frame() -> dict:
+    """Pick the best candidate by quality ranking (or random if disabled)."""
     layout = _pick_layout()
     log.info(
-        "get: layout=%s (device=%s, duo_prob=%.2f)",
+        "build: layout=%s (device=%s, duo_prob=%.2f)",
         layout,
         DEVICE_ORIENTATION,
         DUO_PROBABILITY,
     )
 
-    if layout == "duo":
-        # Pick two DUO_SHAPE assets, second one excluding the first to avoid
-        # showing the same photo twice.
-        a1 = _pick_asset(DUO_SHAPE)
-        try:
-            a2 = _pick_asset(DUO_SHAPE, exclude_ids={a1["id"]})
-        except RuntimeError as e:
-            # Not enough DUO_SHAPE assets in the pool to fill two slots. Fall
-            # back to a single SINGLE_SHAPE asset rather than failing the whole
-            # refresh.
-            log.warning("get: duo failed (%s), falling back to single", e)
-            layout = "single"
-            assets = [_pick_asset(SINGLE_SHAPE)]
+    # If quality scoring is disabled, just pick the first candidate
+    if not QUALITY_ENABLED:
+        if layout == "duo":
+            a1 = _pick_asset(DUO_SHAPE)
+            try:
+                a2 = _pick_asset(DUO_SHAPE, exclude_ids={a1["id"]})
+            except RuntimeError as e:
+                log.warning("duo failed (%s), falling back to single", e)
+                layout = "single"
+                assets = [_pick_asset(SINGLE_SHAPE)]
+            else:
+                assets = [a1, a2]
         else:
-            assets = [a1, a2]
-    else:
-        assets = [_pick_asset(SINGLE_SHAPE)]
+            assets = [_pick_asset(SINGLE_SHAPE)]
+        sources = [_fetch_image(a["id"]) for a in assets]
+        packed, png, jpg = _process(sources, layout)
+        composite_id = "+".join(a["id"] for a in assets)
+        return {
+            "id": composite_id,
+            "bin": packed,
+            "png": png,
+            "jpg": jpg,
+            "layout": layout,
+        }
 
-    sources = [_fetch_image(a["id"]) for a in assets]
-    packed, png, jpg = _process(sources, layout)
-    # Use a compound id so the cache header / log line reflects the duo.
-    composite_id = "+".join(a["id"] for a in assets)
-    entry = {
-        "id": composite_id,
-        "bin": packed,
-        "png": png,
-        "jpg": jpg,
-        "layout": layout,
-    }
-    if use_cache:
-        _cache.clear()
-        _cache[key] = entry
-    return entry
+    # --- Quality ranking path ---
+    candidates = []
+    for i in range(RANKING_BATCH):
+        try:
+            if layout == "duo":
+                a1 = _pick_asset(DUO_SHAPE)
+                try:
+                    a2 = _pick_asset(DUO_SHAPE, exclude_ids={a1["id"]})
+                except RuntimeError:
+                    # Not enough duo assets; fall back to single for this candidate
+                    log.warning("candidate %d: duo failed, skipping", i + 1)
+                    continue
+                assets = [a1, a2]
+            else:
+                assets = [_pick_asset(SINGLE_SHAPE)]
+            # Fetch and compose
+            sources = [_fetch_image(a["id"]) for a in assets]
+            # Compose and rotate to final canvas (before quantization)
+            canvas = _compose_canvas([_normalize_source(s) for s in sources], layout)
+            canvas = _rotate_final_canvas(canvas)
+            # Score the RGB canvas
+            score = _composite_score(canvas)
+            log.info(
+                "candidate %d: score=%.4f (assets: %s)",
+                i + 1,
+                score,
+                [a["id"] for a in assets],
+            )
+            candidates.append((score, assets, canvas))
+        except Exception as e:
+            log.warning("candidate %d generation failed: %s", i + 1, e)
+            continue
+
+    if not candidates:
+        log.error(
+            "No candidates could be generated; falling back to random single pick"
+        )
+        # Ultimate fallback: pick one random asset (single)
+        assets = [_pick_asset(SINGLE_SHAPE)]
+        sources = [_fetch_image(a["id"]) for a in assets]
+        packed, png, jpg = _process(sources, "single")
+        composite_id = assets[0]["id"]
+        return {
+            "id": composite_id,
+            "bin": packed,
+            "png": png,
+            "jpg": jpg,
+            "layout": "single",
+        }
+
+    # Sort by score descending, pick the best
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    best_score, best_assets, best_canvas = candidates[0]
+    log.info(
+        "best candidate score=%.4f, assets=%s",
+        best_score,
+        [a["id"] for a in best_assets],
+    )
+
+    # Pack the best canvas
+    packed, png, jpg = _pack_canvas(best_canvas)
+    composite_id = "+".join(a["id"] for a in best_assets)
+    return {"id": composite_id, "bin": packed, "png": png, "jpg": jpg, "layout": layout}
 
 
 def _no_store(headers: dict) -> dict:
@@ -730,11 +841,10 @@ def _no_store(headers: dict) -> dict:
 
 @app.get("/frame.bin")
 def frame_bin():
-    fresh = request.args.get("fresh") == "1"
-    log.info("request: GET /frame.bin from %s (fresh=%s)", request.remote_addr, fresh)
+    log.info("request: GET /frame.bin from %s", request.remote_addr)
     t0 = time.monotonic()
     try:
-        entry = _get_today(fresh)
+        entry = _build_frame()
     except Exception as e:
         log.exception("frame.bin failed: %s", e)
         return Response(
@@ -756,10 +866,9 @@ def frame_bin():
 
 @app.get("/frame.png")
 def frame_png():
-    fresh = request.args.get("fresh") == "1"
-    log.info("request: GET /frame.png from %s (fresh=%s)", request.remote_addr, fresh)
+    log.info("request: GET /frame.png from %s", request.remote_addr)
     try:
-        entry = _get_today(fresh)
+        entry = _build_frame()
     except Exception as e:
         log.exception("frame.png failed: %s", e)
         return Response(
@@ -774,10 +883,9 @@ def frame_png():
 
 @app.get("/frame.jpg")
 def frame_jpg():
-    fresh = request.args.get("fresh") == "1"
-    log.info("request: GET /frame.jpg from %s (fresh=%s)", request.remote_addr, fresh)
+    log.info("request: GET /frame.jpg from %s", request.remote_addr)
     try:
-        entry = _get_today(fresh)
+        entry = _build_frame()
     except Exception as e:
         log.exception("frame.jpg failed: %s", e)
         return Response(
