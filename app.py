@@ -22,7 +22,7 @@ Config via environment:
 
   Kiosk-style filters (apply to the search path, i.e. when IMMICH_ALBUM_ID is unset;
   EXCLUDED_PEOPLE also applies in album mode):
-  IMMICH_PEOPLE             comma-separated person UUIDs to include
+  IMMICH_INCLUDE_PEOPLE     comma-separated person UUIDs to include
   IMMICH_REQUIRE_ALL_PEOPLE true  -> asset must contain ALL of them (personIds is AND)
                             false -> any of them (picks one at random per fetch)
   IMMICH_EXCLUDED_PEOPLE    comma-separated person UUIDs to drop (filtered locally;
@@ -31,7 +31,6 @@ Config via environment:
   IMMICH_DATE_BEFORE        e.g. 2024-12-31, or the literal "today" (-> takenBefore)
   IMMICH_SEARCH_BATCH       candidates pulled per fetch for local filtering (default 250)
 """
-
 
 import io
 import logging
@@ -84,7 +83,7 @@ def _csv_env(name: str) -> list[str]:
 
 # Kiosk-style filters (search/random path only; album mode is its own curation,
 # matching Kiosk's "filter_date only applies to people and random assets").
-PEOPLE = _csv_env("IMMICH_PEOPLE")                       # person UUIDs to include
+PEOPLE = _csv_env("IMMICH_INCLUDE_PEOPLE")               # person UUIDs to include
 EXCLUDED_PEOPLE = set(_csv_env("IMMICH_EXCLUDED_PEOPLE"))  # person UUIDs to drop
 REQUIRE_ALL_PEOPLE = os.environ.get("IMMICH_REQUIRE_ALL_PEOPLE", "false").lower() == "true"
 DATE_AFTER = os.environ.get("IMMICH_DATE_AFTER", "").strip()   # e.g. 2021-01-01
@@ -92,6 +91,12 @@ DATE_BEFORE = os.environ.get("IMMICH_DATE_BEFORE", "").strip()  # date, or "toda
 # How many candidates to pull per fetch so local exclusion + random pick have
 # something to work with (1..1000).
 SEARCH_BATCH = int(os.environ.get("IMMICH_SEARCH_BATCH", "250"))
+# any | landscape | portrait | square. Immich has no native orientation filter
+# (open feature request: discussions #19478 / #24216 / #9098), so we set
+# withExif and drop non-matching candidates locally before the random pick.
+ORIENTATION = os.environ.get("IMMICH_ORIENTATION", "any").strip().lower()
+if ORIENTATION not in {"any", "landscape", "portrait", "square"}:
+    raise SystemExit(f"IMMICH_ORIENTATION={ORIENTATION!r} must be any|landscape|portrait|square")
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 _level = getattr(logging, LOG_LEVEL, logging.INFO)
@@ -121,12 +126,13 @@ def _log_startup_config() -> None:
         ("IMMICH_URL", IMMICH_URL),
         ("IMMICH_API_KEY", masked),
         ("IMMICH_ALBUM_ID", ALBUM_ID or "(unset -> library/search mode)"),
-        ("IMMICH_PEOPLE", PEOPLE or "(none)"),
+        ("IMMICH_INCLUDE_PEOPLE", PEOPLE or "(none)"),
         ("IMMICH_REQUIRE_ALL_PEOPLE", REQUIRE_ALL_PEOPLE),
         ("IMMICH_EXCLUDED_PEOPLE", sorted(EXCLUDED_PEOPLE) or "(none)"),
         ("IMMICH_DATE_AFTER", DATE_AFTER or "(unset)"),
         ("IMMICH_DATE_BEFORE", DATE_BEFORE or "(unset)"),
         ("IMMICH_SEARCH_BATCH", SEARCH_BATCH),
+        ("IMMICH_ORIENTATION", ORIENTATION),
         ("IMMICH_CACHE", CACHE_ENABLED),
         ("FRAME_ROTATE", ROTATE),
         ("LOG_LEVEL", LOG_LEVEL),
@@ -194,6 +200,27 @@ def _not_excluded(asset: dict) -> bool:
     return True
 
 
+def _orientation_ok(asset: dict) -> bool:
+    """True if the asset matches IMMICH_ORIENTATION. 'any' always passes; 'square'
+    allows a small tolerance because real photos are rarely pixel-perfect square."""
+    if ORIENTATION == "any":
+        return True
+    exif = asset.get("exifInfo") or {}
+    w, h = exif.get("exifImageWidth"), exif.get("exifImageHeight")
+    if not w or not h:
+        # No EXIF dims -> can't classify. Drop it; it's safer than risking a portrait
+        # being shown when the user asked for landscape, and there's almost always
+        # plenty of other candidates in the batch.
+        return False
+    if ORIENTATION == "landscape":
+        return w > h
+    if ORIENTATION == "portrait":
+        return h > w
+    # square
+    longer, shorter = max(w, h), min(w, h)
+    return (longer / shorter) <= 1.05
+
+
 def _search_body() -> dict:
     body: dict = {
         "type": "IMAGE",
@@ -201,6 +228,8 @@ def _search_body() -> dict:
         "withArchived": False,
         # needed so we can apply excluded_people locally
         "withPeople": bool(EXCLUDED_PEOPLE),
+        # needed so we can filter by orientation locally (exifImageWidth/Height)
+        "withExif": ORIENTATION != "any",
     }
     if DATE_AFTER:
         body["takenAfter"] = _iso(DATE_AFTER, end_of_day=False)
@@ -219,9 +248,10 @@ def _pick_asset_id() -> str:
         r = requests.get(f"{IMMICH_URL}/api/albums/{ALBUM_ID}", headers=HEADERS, timeout=30)
         r.raise_for_status()
         raw = [a for a in r.json().get("assets", []) if a.get("type") == "IMAGE"]
-        assets = [a for a in raw if _not_excluded(a)]
-        log.info("pick: album mode, %d image assets, %d after exclusion",
-                 len(raw), len(assets))
+        after_excl = [a for a in raw if _not_excluded(a)]
+        assets = [a for a in after_excl if _orientation_ok(a)]
+        log.info("pick: album mode, %d images, %d after exclusion, %d after orientation=%s",
+                 len(raw), len(after_excl), len(assets), ORIENTATION)
         if not assets:
             raise RuntimeError("album has no matching image assets")
         chosen = random.choice(assets)["id"]
@@ -240,9 +270,10 @@ def _pick_asset_id() -> str:
     data = r.json()
     # current API returns a bare list; tolerate the paged shape too
     raw = data if isinstance(data, list) else data.get("assets", {}).get("items", [])
-    assets = [a for a in raw if _not_excluded(a)]
-    log.info("pick: search returned %d candidates, %d after exclusion",
-             len(raw), len(assets))
+    after_excl = [a for a in raw if _not_excluded(a)]
+    assets = [a for a in after_excl if _orientation_ok(a)]
+    log.info("pick: search returned %d, %d after exclusion, %d after orientation=%s",
+             len(raw), len(after_excl), len(assets), ORIENTATION)
     if not assets:
         raise RuntimeError("no assets matched the configured filters")
     chosen = random.choice(assets)["id"]
