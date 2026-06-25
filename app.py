@@ -46,11 +46,18 @@ Config via environment:
                               landscape" or similar — it bypasses the duo logic.
 
   Labels (drawn on top of each slot, before quantization so the text stays crisp):
-  IMMICH_SHOW_NAMES         true (default) | false. Draw person names at the top
-                            of each slot in black text on a white rectangle.
-                            Requires Immich face recognition to have run.
+  IMMICH_SHOW_NAMES         true (default) | false. Draw person names in a
+                            corner of each slot in black text on a white
+                            rectangle. Requires Immich face recognition to
+                            have run.
   IMMICH_LABEL_FONT_SIZE    px, default 18. Scales DejaVu Sans Bold (provided
                             by fonts-dejavu-core in the image).
+  IMMICH_LABEL_CORNER       top-left | top-middle | top-right |
+                            bottom-left | bottom-middle | bottom-right (default).
+                            In duo layouts, the position is relative to the SLOT,
+                            not the canvas.
+  IMMICH_FIRST_NAME_ONLY    true (default) | false. Split each name on whitespace
+                            and use the first token only ("Henry Bull" -> "Henry").
 
   Kiosk-style filters (apply to the search path, i.e. when IMMICH_ALBUM_ID is unset;
   EXCLUDE_PEOPLE also applies in album mode):
@@ -122,10 +129,6 @@ PALETTE_RGB = [
     (45, 65, 170),  # blue
     (35, 130, 75),  # green
 ]
-
-# Map palette indices (0..5) to the 4-bit colour codes used by the E6 panel.
-# The panel's colour order is: black, white, yellow, red, blue, green.
-# Note the gap: 0x4 is unused on this panel (it was orange on the older 7‑colour "F" panel).
 CODE_LUT = np.array([0x0, 0x1, 0x2, 0x3, 0x5, 0x6], dtype=np.uint8)
 
 IMMICH_URL = os.environ.get("IMMICH_URL", "http://immich-server:2283").rstrip("/")
@@ -224,6 +227,27 @@ QUALITY_ENABLED = os.environ.get("IMMICH_QUALITY_ENABLED", "true").lower() != "f
 SHOW_NAMES = os.environ.get("IMMICH_SHOW_NAMES", "true").lower() != "false"
 LABEL_FONT_SIZE = int(os.environ.get("IMMICH_LABEL_FONT_SIZE", "18"))
 LABEL_PADDING = 6  # px around text inside the white pill
+# Corner of each slot to anchor labels in. Note: in duo layouts this is the
+# corner of the SLOT, not the canvas — so e.g. "bottom-right" in a landscape
+# duo places one label at the bottom-right of the left photo and another at
+# the bottom-right of the right photo, not both crammed into one corner.
+LABEL_CORNER = os.environ.get("IMMICH_LABEL_CORNER", "bottom-right").strip().lower()
+_VALID_CORNERS = {
+    "top-left",
+    "top-middle",
+    "top-right",
+    "bottom-left",
+    "bottom-middle",
+    "bottom-right",
+}
+if LABEL_CORNER not in _VALID_CORNERS:
+    raise SystemExit(
+        f"IMMICH_LABEL_CORNER={LABEL_CORNER!r} must be one of {sorted(_VALID_CORNERS)}"
+    )
+# First name only: split on whitespace, take token 0. Useful when your Immich
+# face tags use full names ("Henry Bull" -> "Henry") and you don't want the
+# label to take up half the photo.
+FIRST_NAME_ONLY = os.environ.get("IMMICH_FIRST_NAME_ONLY", "true").lower() != "false"
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 _level = getattr(logging, LOG_LEVEL, logging.INFO)
@@ -327,6 +351,8 @@ def _log_startup_config() -> None:
         ("IMMICH_DITHER", DITHER_ENABLED),
         ("IMMICH_SHOW_NAMES", SHOW_NAMES),
         ("IMMICH_LABEL_FONT_SIZE", LABEL_FONT_SIZE),
+        ("IMMICH_LABEL_CORNER", LABEL_CORNER),
+        ("IMMICH_FIRST_NAME_ONLY", FIRST_NAME_ONLY),
         ("FRAME_ROTATE", ROTATE),
         ("LOG_LEVEL", LOG_LEVEL),
         ("IMMICH_RANKING_BATCH", RANKING_BATCH),
@@ -476,12 +502,22 @@ def _shape_matches(asset: dict, target: str) -> bool:
 def _asset_names(asset: dict) -> list[str]:
     """Return non-empty person names from the asset, deduped, preserving the
     order Immich returns them. Immich includes unnamed face clusters with empty
-    name strings; skip those rather than rendering "Anna, , , Henry"."""
+    name strings; skip those rather than rendering "Anna, , , Henry".
+
+    When FIRST_NAME_ONLY, the first whitespace-separated token is used. Dedup
+    happens AFTER trimming so "Henry Bull" and "Henry James" collapse to one
+    "Henry" entry — desirable if you mostly have one Henry in your library,
+    accept the corner case otherwise.
+    """
     seen: set[str] = set()
     out: list[str] = []
     for p in asset.get("people", []) or []:
         name = (p.get("name") or "").strip()
-        if not name or name in seen:
+        if not name:
+            continue
+        if FIRST_NAME_ONLY:
+            name = name.split()[0]
+        if name in seen:
             continue
         seen.add(name)
         out.append(name)
@@ -649,10 +685,12 @@ def _draw_name_label(
     slot_x: int,
     slot_y: int,
     slot_w: int,
+    slot_h: int,
 ) -> None:
-    """Draw "Name, Name, Name" at the top of a slot. Black text on a white
-    rectangle, padded LABEL_PADDING. Truncates with an ellipsis if the joined
-    string doesn't fit in slot_w. No-op if names is empty or SHOW_NAMES is off.
+    """Draw "Name, Name, Name" anchored to LABEL_CORNER of a slot. Black text
+    on a white rectangle, padded LABEL_PADDING. Truncates with an ellipsis if
+    the joined string doesn't fit in slot_w. No-op if names is empty or
+    SHOW_NAMES is off.
     """
     if not names or not SHOW_NAMES:
         return
@@ -669,17 +707,28 @@ def _draw_name_label(
 
     tw = draw.textlength(text, font=_LABEL_FONT)
     # ascent+descent gives a tighter, more predictable label box than textbbox
-    # for short labels.
-    try:
-        ascent, descent = _LABEL_FONT.getmetrics()
-        th = ascent + descent
-    except AttributeError:
-        th = 14  # Pillow's bitmap default lacks getmetrics
+    # for short labels. Pillow's bitmap default font lacks getmetrics(), so use
+    # getattr to handle both the FreeTypeFont and ImageFont base cases without
+    # tripping the type checker on a union-typed attribute access.
+    metrics = getattr(_LABEL_FONT, "getmetrics", lambda: (12, 2))()
+    th = metrics[0] + metrics[1]
 
     rect_w = int(tw) + 2 * LABEL_PADDING
     rect_h = th + 2 * LABEL_PADDING
-    rect_x = slot_x + (slot_w - rect_w) // 2
-    rect_y = slot_y
+
+    # Pin the label rectangle to the requested corner of the slot. No outside
+    # margin — the label sits flush against the slot edge.
+    if LABEL_CORNER.endswith("-left"):
+        rect_x = slot_x
+    elif LABEL_CORNER.endswith("-middle"):
+        rect_x = slot_x + (slot_w - rect_w) // 2
+    else:  # -right
+        rect_x = slot_x + slot_w - rect_w
+    if LABEL_CORNER.startswith("top-"):
+        rect_y = slot_y
+    else:  # bottom-
+        rect_y = slot_y + slot_h - rect_h
+
     draw.rectangle(
         (rect_x, rect_y, rect_x + rect_w, rect_y + rect_h),
         fill=(255, 255, 255),
@@ -708,7 +757,7 @@ def _compose_canvas(
     if layout == "single":
         assert len(sources) == 1 and len(assets) == 1
         canvas.paste(_fit_to_slot(sources[0], CANVAS_W, CANVAS_H), (0, 0))
-        _draw_name_label(canvas, _asset_names(assets[0]), 0, 0, CANVAS_W)
+        _draw_name_label(canvas, _asset_names(assets[0]), 0, 0, CANVAS_W, CANVAS_H)
         return canvas
 
     assert layout == "duo" and len(sources) == 2 and len(assets) == 2
@@ -718,15 +767,15 @@ def _compose_canvas(
         slot_w, slot_h = CANVAS_W // 2, CANVAS_H
         canvas.paste(_fit_to_slot(sources[0], slot_w, slot_h), (0, 0))
         canvas.paste(_fit_to_slot(sources[1], slot_w, slot_h), (slot_w, 0))
-        _draw_name_label(canvas, _asset_names(assets[0]), 0, 0, slot_w)
-        _draw_name_label(canvas, _asset_names(assets[1]), slot_w, 0, slot_w)
+        _draw_name_label(canvas, _asset_names(assets[0]), 0, 0, slot_w, slot_h)
+        _draw_name_label(canvas, _asset_names(assets[1]), slot_w, 0, slot_w, slot_h)
     else:
         # Two landscape slots stacked vertically.
         slot_w, slot_h = CANVAS_W, CANVAS_H // 2
         canvas.paste(_fit_to_slot(sources[0], slot_w, slot_h), (0, 0))
         canvas.paste(_fit_to_slot(sources[1], slot_w, slot_h), (0, slot_h))
-        _draw_name_label(canvas, _asset_names(assets[0]), 0, 0, slot_w)
-        _draw_name_label(canvas, _asset_names(assets[1]), 0, slot_h, slot_w)
+        _draw_name_label(canvas, _asset_names(assets[0]), 0, 0, slot_w, slot_h)
+        _draw_name_label(canvas, _asset_names(assets[1]), 0, slot_h, slot_w, slot_h)
     return canvas
 
 
