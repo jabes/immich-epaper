@@ -31,7 +31,6 @@ except Exception as e:
 PANEL_W, PANEL_H = 800, 480  # The panel itself is always landscape-native
 FRAME_BYTES = PANEL_W * PANEL_H // 2  # 192000 bytes
 
-# Legacy tracking variables for canvas compositions
 WIDTH, HEIGHT = PANEL_W, PANEL_H
 
 PALETTE_RGB = [
@@ -52,7 +51,6 @@ IMMICH_PUBLIC_URL = os.environ.get("IMMICH_PUBLIC_URL", IMMICH_URL).rstrip("/")
 API_KEY = os.environ["IMMICH_API_KEY"]
 ALBUM_ID = os.environ.get("IMMICH_ALBUM_ID", "").strip()
 ROTATE = int(os.environ.get("FRAME_ROTATE", "0"))
-DITHER_ENABLED = os.environ.get("IMMICH_DITHER", "true").lower() != "false"
 
 
 def _csv_env(name: str) -> list[str]:
@@ -113,7 +111,6 @@ FIRST_NAME_ONLY = os.environ.get("IMMICH_FIRST_NAME_ONLY", "true").lower() != "f
 LABEL_DELIMITER = os.environ.get("IMMICH_LABEL_DELIMITER", " - ")
 LABEL_FONT = os.environ.get("IMMICH_LABEL_FONT", "DejaVuSans-Bold").strip()
 
-# Logging infrastructure override for Gunicorn/Docker harmony
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 _level = getattr(logging, LOG_LEVEL, logging.INFO)
 
@@ -194,7 +191,6 @@ def _log_startup_config() -> None:
         ("IMMICH_DUO_PROBABILITY", DUO_PROBABILITY),
         ("IMMICH_ASSET_ORIENTATION", ASSET_ORIENTATION),
         ("IMMICH_CROP", CROP_MODE),
-        ("IMMICH_DITHER", DITHER_ENABLED),
         ("IMMICH_SHOW_NAMES", SHOW_NAMES),
         ("IMMICH_LABEL_FONT_SIZE", LABEL_FONT_SIZE),
         ("IMMICH_LABEL_FONT", LABEL_FONT),
@@ -496,8 +492,11 @@ def _rotate_final_canvas(canvas: Image.Image) -> Image.Image:
     return canvas
 
 
-def _pack_canvas(canvas: Image.Image) -> tuple[bytes, bytes, bytes]:
-    if DITHER_ENABLED:
+# ---------------------------------------------------------------------------
+# Dynamic Quantization Packing Engine
+# ---------------------------------------------------------------------------
+def _pack_canvas_with_dither_mode(canvas: Image.Image, dither: bool) -> tuple[bytes, Image.Image]:
+    if dither:
         quant = canvas.quantize(palette=_PAL_IMG, dither=Image.Dither.FLOYDSTEINBERG)
         preview_source = quant.convert("RGB")
     else:
@@ -511,33 +510,7 @@ def _pack_canvas(canvas: Image.Image) -> tuple[bytes, bytes, bytes]:
     packed = (hi | lo).astype(np.uint8).tobytes()
     assert len(packed) == FRAME_BYTES, len(packed)
 
-    png_buf = io.BytesIO()
-    preview_source.save(png_buf, format="PNG")
-    jpg_buf = io.BytesIO()
-    preview_source.save(jpg_buf, format="JPEG", quality=85, optimize=True)
-    return packed, png_buf.getvalue(), jpg_buf.getvalue()
-
-
-def _process(sources: list[Image.Image], assets: list[dict], layout: str) -> tuple[bytes, bytes, bytes]:
-    t0 = time.monotonic()
-    sources = [_normalize_source(s) for s in sources]
-    canvas = _compose_canvas(sources, layout, assets)
-    canvas = _rotate_final_canvas(canvas)
-    packed, png, jpg = _pack_canvas(canvas)
-
-    log.info(
-        "process: layout=%s sources=%d packed=%d png=%d jpg=%d, crop=%s, dither=%s, rotate=%s, %.0f ms",
-        layout,
-        len(sources),
-        len(packed),
-        len(png),
-        len(jpg),
-        CROP_MODE,
-        DITHER_ENABLED,
-        ROTATE,
-        (time.monotonic() - t0) * 1000,
-    )
-    return packed, png, jpg
+    return packed, preview_source
 
 
 # ---------------------------------------------------------------------------
@@ -597,9 +570,11 @@ def _composite_score(img: Image.Image) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Core Layout Matrix Builder
+# Core Layout Matrix Builder (Returns clean unquantized RGB canvas)
 # ---------------------------------------------------------------------------
-def _build_frame() -> dict:
+def _build_frame() -> tuple[str, str, Image.Image]:
+    """Generates the optimal layout and returns a crisp unquantized final composition.
+    Returns tuple of (composite_id, layout_type, final_unquantized_canvas_object)."""
     layout = _pick_layout()
     log.info("build: layout=%s (device=%s, duo_prob=%.2f)", layout, DEVICE_ORIENTATION, DUO_PROBABILITY)
 
@@ -618,14 +593,10 @@ def _build_frame() -> dict:
             assets = [_pick_asset(SINGLE_SHAPE)]
 
         sources = [_fetch_image(a["id"]) for a in assets]
-        packed, png, jpg = _process(sources, assets, layout)
-        return {
-            "id": "+".join(a["id"] for a in assets),
-            "bin": packed,
-            "png": png,
-            "jpg": jpg,
-            "layout": layout,
-        }
+        sources = [_normalize_source(s) for s in sources]
+        canvas = _compose_canvas(sources, layout, assets)
+        canvas = _rotate_final_canvas(canvas)
+        return "+".join(a["id"] for a in assets), layout, canvas
 
     candidates = []
     for i in range(RANKING_BATCH):
@@ -640,9 +611,11 @@ def _build_frame() -> dict:
                 assets = [a1, a2]
             else:
                 assets = [_pick_asset(SINGLE_SHAPE)]
+
             sources = [_fetch_image(a["id"]) for a in assets]
             canvas = _compose_canvas([_normalize_source(s) for s in sources], layout, assets)
             canvas = _rotate_final_canvas(canvas)
+
             score = _composite_score(canvas)
             log.info("candidate %d: score=%.4f (assets: %s)", i + 1, score, [a["id"] for a in assets])
             candidates.append((score, assets, canvas))
@@ -654,15 +627,15 @@ def _build_frame() -> dict:
         log.error("No candidates could be generated; falling back to random single pick")
         assets = [_pick_asset(SINGLE_SHAPE)]
         sources = [_fetch_image(a["id"]) for a in assets]
-        packed, png, jpg = _process(sources, assets, "single")
-        return {"id": assets[0]["id"], "bin": packed, "png": png, "jpg": jpg, "layout": "single"}
+        canvas = _compose_canvas([_normalize_source(s) for s in sources], "single", assets)
+        canvas = _rotate_final_canvas(canvas)
+        return assets[0]["id"], "single", canvas
 
     candidates.sort(key=lambda x: x[0], reverse=True)
     best_score, best_assets, best_canvas = candidates[0]
     log.info("best candidate score=%.4f, assets=%s", best_score, [a["id"] for a in best_assets])
 
-    packed, png, jpg = _pack_canvas(best_canvas)
-    return {"id": "+".join(a["id"] for a in best_assets), "bin": packed, "png": png, "jpg": jpg, "layout": layout}
+    return "+".join(a["id"] for a in best_assets), layout, best_canvas
 
 
 def _no_store(headers: dict) -> dict:
@@ -670,22 +643,24 @@ def _no_store(headers: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# API Routing Endpoints
+# API Routing Endpoints (Now enforcing format-specific dithering)
 # ---------------------------------------------------------------------------
 @app.get("/frame.bin")
 def frame_bin():
     log.info("request: GET /frame.bin from %s", request.remote_addr)
     t0 = time.monotonic()
     try:
-        entry = _build_frame()
+        asset_id, _, canvas = _build_frame()
+        # Default hardware fallback dither choice: true
+        packed, _ = _pack_canvas_with_dither_mode(canvas, dither=True)
     except Exception as e:
         log.exception("frame.bin failed: %s", e)
         return Response(f"frame generation failed: {e}\n", status=503, mimetype="text/plain")
-    log.info("request: served /frame.bin asset %s in %.0f ms", entry["id"], (time.monotonic() - t0) * 1000)
+    log.info("request: served /frame.bin asset %s in %.0f ms", asset_id, (time.monotonic() - t0) * 1000)
     return Response(
-        entry["bin"],
+        packed,
         mimetype="application/octet-stream",
-        headers=_no_store({"X-Immich-Asset-Id": entry["id"], "Content-Length": str(FRAME_BYTES)}),
+        headers=_no_store({"X-Immich-Asset-Id": asset_id, "Content-Length": str(FRAME_BYTES)}),
     )
 
 
@@ -693,22 +668,32 @@ def frame_bin():
 def frame_png():
     log.info("request: GET /frame.png from %s", request.remote_addr)
     try:
-        entry = _build_frame()
+        asset_id, _, canvas = _build_frame()
+        # PNG explicitly forces dither evaluation
+        _, preview_source = _pack_canvas_with_dither_mode(canvas, dither=True)
+        png_buf = io.BytesIO()
+        preview_source.save(png_buf, format="PNG")
+        png_data = png_buf.getvalue()
     except Exception as e:
         log.exception("frame.png failed: %s", e)
         return Response(f"frame generation failed: {e}\n", status=503, mimetype="text/plain")
-    return Response(entry["png"], mimetype="image/png", headers=_no_store({"X-Immich-Asset-Id": entry["id"]}))
+    return Response(png_data, mimetype="image/png", headers=_no_store({"X-Immich-Asset-Id": asset_id}))
 
 
 @app.get("/frame.jpg")
 def frame_jpg():
     log.info("request: GET /frame.jpg from %s", request.remote_addr)
     try:
-        entry = _build_frame()
+        asset_id, _, canvas = _build_frame()
+        # JPG explicitly drops dithering rules
+        _, preview_source = _pack_canvas_with_dither_mode(canvas, dither=False)
+        jpg_buf = io.BytesIO()
+        preview_source.save(jpg_buf, format="JPEG", quality=85, optimize=True)
+        jpg_data = jpg_buf.getvalue()
     except Exception as e:
         log.exception("frame.jpg failed: %s", e)
         return Response(f"frame generation failed: {e}\n", status=503, mimetype="text/plain")
-    return Response(entry["jpg"], mimetype="image/jpeg", headers=_no_store({"X-Immich-Asset-Id": entry["id"]}))
+    return Response(jpg_data, mimetype="image/jpeg", headers=_no_store({"X-Immich-Asset-Id": asset_id}))
 
 
 @app.get("/healthz")
