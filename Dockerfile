@@ -25,6 +25,7 @@ FROM python:3.12-slim
 
 # All required runtime libraries for opencv-python-headless
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    fonts-dejavu-core \
     libglib2.0-0 \
     libxcb1 \
     libgl1 \

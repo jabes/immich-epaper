@@ -58,6 +58,9 @@ Config via environment:
                             not the canvas.
   IMMICH_FIRST_NAME_ONLY    true (default) | false. Split each name on whitespace
                             and use the first token only ("Henry Bull" -> "Henry").
+  IMMICH_LABEL_DELIMITER    String between names. Default " - ". Whitespace is
+                            preserved as written, so " - " gives "Henry - Maya"
+                            while "-" gives "Henry-Maya".
 
   Kiosk-style filters (apply to the search path, i.e. when IMMICH_ALBUM_ID is unset;
   EXCLUDE_PEOPLE also applies in album mode):
@@ -248,6 +251,10 @@ if LABEL_CORNER not in _VALID_CORNERS:
 # face tags use full names ("Henry Bull" -> "Henry") and you don't want the
 # label to take up half the photo.
 FIRST_NAME_ONLY = os.environ.get("IMMICH_FIRST_NAME_ONLY", "true").lower() != "false"
+# Separator between names. Default " - "; common alternatives: ", " or " · ".
+# Any string is accepted; surrounding whitespace is preserved verbatim from
+# the env var so you can control padding (e.g. "-" with no spaces).
+LABEL_DELIMITER = os.environ.get("IMMICH_LABEL_DELIMITER", " - ")
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 _level = getattr(logging, LOG_LEVEL, logging.INFO)
@@ -353,6 +360,7 @@ def _log_startup_config() -> None:
         ("IMMICH_LABEL_FONT_SIZE", LABEL_FONT_SIZE),
         ("IMMICH_LABEL_CORNER", LABEL_CORNER),
         ("IMMICH_FIRST_NAME_ONLY", FIRST_NAME_ONLY),
+        ("IMMICH_LABEL_DELIMITER", repr(LABEL_DELIMITER)),
         ("FRAME_ROTATE", ROTATE),
         ("LOG_LEVEL", LOG_LEVEL),
         ("IMMICH_RANKING_BATCH", RANKING_BATCH),
@@ -695,15 +703,17 @@ def _draw_name_label(
     if not names or not SHOW_NAMES:
         return
     draw = ImageDraw.Draw(canvas)
-    text = ", ".join(names)
+    text = LABEL_DELIMITER.join(names)
     max_text_w = slot_w - 2 * LABEL_PADDING
 
-    # Truncate with ellipsis if the joined names overflow the slot.
+    # Truncate with ellipsis if the joined names overflow the slot. Strip any
+    # characters from the delimiter when tidying the tail so we don't end up
+    # with a dangling separator before the ellipsis.
     if draw.textlength(text, font=_LABEL_FONT) > max_text_w:
         ell = "…"
         while text and draw.textlength(text + ell, font=_LABEL_FONT) > max_text_w:
             text = text[:-1]
-        text = text.rstrip(", ") + ell
+        text = text.rstrip(LABEL_DELIMITER) + ell
 
     tw = draw.textlength(text, font=_LABEL_FONT)
     # ascent+descent gives a tighter, more predictable label box than textbbox
