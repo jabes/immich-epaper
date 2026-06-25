@@ -169,9 +169,7 @@ def _csv_env(name: str) -> list[str]:
 # matching Kiosk's "filter_date only applies to people and random assets").
 INCLUDE_PEOPLE = _csv_env("IMMICH_INCLUDE_PEOPLE")  # person UUIDs to include
 EXCLUDE_PEOPLE = set(_csv_env("IMMICH_EXCLUDE_PEOPLE"))  # person UUIDs to drop
-REQUIRE_ALL_PEOPLE = (
-    os.environ.get("IMMICH_REQUIRE_ALL_PEOPLE", "false").lower() == "true"
-)
+REQUIRE_ALL_PEOPLE = os.environ.get("IMMICH_REQUIRE_ALL_PEOPLE", "false").lower() == "true"
 DATE_AFTER = os.environ.get("IMMICH_DATE_AFTER", "").strip()  # e.g. 2021-01-01
 DATE_BEFORE = os.environ.get("IMMICH_DATE_BEFORE", "").strip()  # date, or "today"
 # How many candidates to pull per fetch so local exclusion + random pick have
@@ -179,13 +177,9 @@ DATE_BEFORE = os.environ.get("IMMICH_DATE_BEFORE", "").strip()  # date, or "toda
 SEARCH_BATCH = int(os.environ.get("IMMICH_SEARCH_BATCH", "250"))
 
 # Device orientation determines the canvas shape and the duo direction.
-DEVICE_ORIENTATION = (
-    os.environ.get("IMMICH_DEVICE_ORIENTATION", "landscape").strip().lower()
-)
+DEVICE_ORIENTATION = os.environ.get("IMMICH_DEVICE_ORIENTATION", "landscape").strip().lower()
 if DEVICE_ORIENTATION not in {"landscape", "portrait"}:
-    raise SystemExit(
-        f"IMMICH_DEVICE_ORIENTATION={DEVICE_ORIENTATION!r} must be landscape|portrait"
-    )
+    raise SystemExit(f"IMMICH_DEVICE_ORIENTATION={DEVICE_ORIENTATION!r} must be landscape|portrait")
 
 # Canvas dimensions match the device orientation; we rotate at the end so the
 # panel always receives an 800x480 packed buffer.
@@ -205,9 +199,7 @@ try:
 except ValueError:
     raise SystemExit("IMMICH_DUO_PROBABILITY must be a float between 0 and 1")
 if not 0.0 <= DUO_PROBABILITY <= 1.0:
-    raise SystemExit(
-        f"IMMICH_DUO_PROBABILITY={DUO_PROBABILITY} must be between 0 and 1"
-    )
+    raise SystemExit(f"IMMICH_DUO_PROBABILITY={DUO_PROBABILITY} must be between 0 and 1")
 
 # Manual override that forces every pick to a single shape. 'any' (default)
 # lets the duo logic operate normally. Set to 'landscape' if you want to
@@ -215,9 +207,7 @@ if not 0.0 <= DUO_PROBABILITY <= 1.0:
 # effectively disables duo composition.
 ASSET_ORIENTATION = os.environ.get("IMMICH_ASSET_ORIENTATION", "any").strip().lower()
 if ASSET_ORIENTATION not in {"any", "landscape", "portrait", "square"}:
-    raise SystemExit(
-        f"IMMICH_ASSET_ORIENTATION={ASSET_ORIENTATION!r} must be any|landscape|portrait|square"
-    )
+    raise SystemExit(f"IMMICH_ASSET_ORIENTATION={ASSET_ORIENTATION!r} must be any|landscape|portrait|square")
 
 # center | smart. smart uses smartcrop.py (edge/saturation/skin heuristics) to
 # pick the most "interesting" 800x480 window from the source, then falls back to
@@ -226,9 +216,7 @@ CROP_MODE = os.environ.get("IMMICH_CROP", "center").strip().lower()
 if CROP_MODE not in {"center", "smart"}:
     raise SystemExit(f"IMMICH_CROP={CROP_MODE!r} must be center|smart")
 if CROP_MODE == "smart" and _SMARTCROP is None:
-    raise SystemExit(
-        f"IMMICH_CROP=smart but smartcrop import failed: {_SMARTCROP_ERROR!r}"
-    )
+    raise SystemExit(f"IMMICH_CROP=smart but smartcrop import failed: {_SMARTCROP_ERROR!r}")
 
 # Quality ranking settings
 RANKING_BATCH = int(os.environ.get("IMMICH_RANKING_BATCH", "5"))
@@ -260,9 +248,7 @@ _VALID_CORNERS = {
     "bottom-right",
 }
 if LABEL_CORNER not in _VALID_CORNERS:
-    raise SystemExit(
-        f"IMMICH_LABEL_CORNER={LABEL_CORNER!r} must be one of {sorted(_VALID_CORNERS)}"
-    )
+    raise SystemExit(f"IMMICH_LABEL_CORNER={LABEL_CORNER!r} must be one of {sorted(_VALID_CORNERS)}")
 # First name only: split on whitespace, take token 0. Useful when your Immich
 # face tags use full names ("Henry Bull" -> "Henry") and you don't want the
 # label to take up half the photo.
@@ -331,8 +317,7 @@ def _load_font(size: int):
         except (OSError, IOError):
             continue
     log.warning(
-        "No DejaVu font found (tried %s); using Pillow default (text will look bad). "
-        "Add `fonts-dejavu-core` (or `fonts-dejavu` for the full set) to the Dockerfile.",
+        "No DejaVu font found (tried %s); using Pillow default (text will look bad). Add `fonts-dejavu-core` (or `fonts-dejavu` for the full set) to the Dockerfile.",
         tried,
     )
     return ImageFont.load_default()
@@ -431,9 +416,7 @@ _PAL_IMG = _build_palette_image()
 def _center_fit(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
     """Cover-crop to exactly target_w x target_h, centred. The fallback for both
     smart-crop failure and as the default crop mode."""
-    return ImageOps.fit(
-        img, (target_w, target_h), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5)
-    )
+    return ImageOps.fit(img, (target_w, target_h), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
 
 
 def _smart_fit(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
@@ -483,9 +466,7 @@ def _smart_fit(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
 
 def _fit_to_slot(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
     """Apply the configured crop mode at the requested slot dimensions."""
-    return (_smart_fit if CROP_MODE == "smart" else _center_fit)(
-        img, target_w, target_h
-    )
+    return (_smart_fit if CROP_MODE == "smart" else _center_fit)(img, target_w, target_h)
 
 
 def _not_excluded(asset: dict) -> bool:
@@ -614,9 +595,7 @@ def _pick_asset(shape: str, exclude_ids: set[str] | None = None) -> dict:
         return True
 
     if ALBUM_ID:
-        r = requests.get(
-            f"{IMMICH_URL}/api/albums/{ALBUM_ID}", headers=HEADERS, timeout=30
-        )
+        r = requests.get(f"{IMMICH_URL}/api/albums/{ALBUM_ID}", headers=HEADERS, timeout=30)
         r.raise_for_status()
         raw = [a for a in r.json().get("assets", []) if a.get("type") == "IMAGE"]
         after_excl = [a for a in raw if _not_excluded(a) and a["id"] not in exclude_ids]
@@ -786,9 +765,7 @@ def _draw_name_label(
     )
 
 
-def _compose_canvas(
-    sources: list[Image.Image], layout: str, assets: list[dict]
-) -> Image.Image:
+def _compose_canvas(sources: list[Image.Image], layout: str, assets: list[dict]) -> Image.Image:
     """Build the final RGB canvas (CANVAS_W x CANVAS_H) before rotation and
     quantization. The `assets` argument is parallel to `sources` and supplies
     the names used for per-slot labels.
@@ -859,9 +836,7 @@ def _pack_canvas(canvas: Image.Image) -> tuple[bytes, bytes, bytes]:
     return packed, png_buf.getvalue(), jpg_buf.getvalue()
 
 
-def _process(
-    sources: list[Image.Image], assets: list[dict], layout: str
-) -> tuple[bytes, bytes, bytes]:
+def _process(sources: list[Image.Image], assets: list[dict], layout: str) -> tuple[bytes, bytes, bytes]:
     """Compose, rotate, pack, and return (packed, png, jpg)."""
     t0 = time.monotonic()
     sources = [_normalize_source(s) for s in sources]
@@ -1001,9 +976,7 @@ def _build_frame() -> dict:
             # Fetch and compose
             sources = [_fetch_image(a["id"]) for a in assets]
             # Compose (with labels) and rotate to final canvas, before quantization
-            canvas = _compose_canvas(
-                [_normalize_source(s) for s in sources], layout, assets
-            )
+            canvas = _compose_canvas([_normalize_source(s) for s in sources], layout, assets)
             canvas = _rotate_final_canvas(canvas)
             # Score the RGB canvas. NB: scoring runs against the labelled canvas,
             # so quality models see the white label pills too. This shifts scores
@@ -1023,9 +996,7 @@ def _build_frame() -> dict:
             continue
 
     if not candidates:
-        log.error(
-            "No candidates could be generated; falling back to random single pick"
-        )
+        log.error("No candidates could be generated; falling back to random single pick")
         # Ultimate fallback: pick one random asset (single)
         assets = [_pick_asset(SINGLE_SHAPE)]
         sources = [_fetch_image(a["id"]) for a in assets]
@@ -1069,9 +1040,7 @@ def frame_bin():
         entry = _build_frame()
     except Exception as e:
         log.exception("frame.bin failed: %s", e)
-        return Response(
-            f"frame generation failed: {e}\n", status=503, mimetype="text/plain"
-        )
+        return Response(f"frame generation failed: {e}\n", status=503, mimetype="text/plain")
     log.info(
         "request: served /frame.bin asset %s in %.0f ms",
         entry["id"],
@@ -1080,9 +1049,7 @@ def frame_bin():
     return Response(
         entry["bin"],
         mimetype="application/octet-stream",
-        headers=_no_store(
-            {"X-Immich-Asset-Id": entry["id"], "Content-Length": str(FRAME_BYTES)}
-        ),
+        headers=_no_store({"X-Immich-Asset-Id": entry["id"], "Content-Length": str(FRAME_BYTES)}),
     )
 
 
@@ -1093,9 +1060,7 @@ def frame_png():
         entry = _build_frame()
     except Exception as e:
         log.exception("frame.png failed: %s", e)
-        return Response(
-            f"frame generation failed: {e}\n", status=503, mimetype="text/plain"
-        )
+        return Response(f"frame generation failed: {e}\n", status=503, mimetype="text/plain")
     return Response(
         entry["png"],
         mimetype="image/png",
@@ -1110,9 +1075,7 @@ def frame_jpg():
         entry = _build_frame()
     except Exception as e:
         log.exception("frame.jpg failed: %s", e)
-        return Response(
-            f"frame generation failed: {e}\n", status=503, mimetype="text/plain"
-        )
+        return Response(f"frame generation failed: {e}\n", status=503, mimetype="text/plain")
     return Response(
         entry["jpg"],
         mimetype="image/jpeg",
