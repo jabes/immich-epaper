@@ -63,6 +63,10 @@ Config via environment:
                             bottom-left | bottom-middle | bottom-right (default).
                             In duo layouts, the position is relative to the SLOT,
                             not the canvas.
+  IMMICH_LABEL_PADDING_X    px gap to the left/right of the text inside the
+                            white pill, default 4.
+  IMMICH_LABEL_PADDING_Y    px gap above/below the text inside the white pill,
+                            default 6.
   IMMICH_FIRST_NAME_ONLY    true (default) | false. Split each name on whitespace
                             and use the first token only ("Henry Bull" -> "Henry").
   IMMICH_LABEL_DELIMITER    String between names. Default " - ". Whitespace is
@@ -236,7 +240,12 @@ QUALITY_ENABLED = os.environ.get("IMMICH_QUALITY_ENABLED", "true").lower() != "f
 # pick up rainbow speckles from surrounding pixels).
 SHOW_NAMES = os.environ.get("IMMICH_SHOW_NAMES", "true").lower() != "false"
 LABEL_FONT_SIZE = int(os.environ.get("IMMICH_LABEL_FONT_SIZE", "18"))
-LABEL_PADDING = 6  # px around text inside the white pill
+# Padding inside the white label pill, around the text. X is left/right gap,
+# Y is top/bottom gap. Defaults are tuned for DejaVuSans-Bold at 18px: narrow
+# horizontal padding to keep names tight, taller vertical padding so descenders
+# (g, p, y) aren't clipped against the pill edge.
+LABEL_PADDING_X = int(os.environ.get("IMMICH_LABEL_PADDING_X", "4"))
+LABEL_PADDING_Y = int(os.environ.get("IMMICH_LABEL_PADDING_Y", "6"))
 # Corner of each slot to anchor labels in. Note: in duo layouts this is the
 # corner of the SLOT, not the canvas — so e.g. "bottom-right" in a landscape
 # duo places one label at the bottom-right of the left photo and another at
@@ -382,6 +391,8 @@ def _log_startup_config() -> None:
         ("IMMICH_SHOW_NAMES", SHOW_NAMES),
         ("IMMICH_LABEL_FONT_SIZE", LABEL_FONT_SIZE),
         ("IMMICH_LABEL_FONT", LABEL_FONT),
+        ("IMMICH_LABEL_PADDING_X", LABEL_PADDING_X),
+        ("IMMICH_LABEL_PADDING_Y", LABEL_PADDING_Y),
         ("IMMICH_LABEL_CORNER", LABEL_CORNER),
         ("IMMICH_FIRST_NAME_ONLY", FIRST_NAME_ONLY),
         ("IMMICH_LABEL_DELIMITER", repr(LABEL_DELIMITER)),
@@ -720,7 +731,7 @@ def _draw_name_label(
     slot_h: int,
 ) -> None:
     """Draw "Name, Name, Name" anchored to LABEL_CORNER of a slot. Black text
-    on a white rectangle, padded LABEL_PADDING. Truncates with an ellipsis if
+    on a white rectangle, padded LABEL_PADDING_X/Y. Truncates with an ellipsis if
     the joined string doesn't fit in slot_w. No-op if names is empty or
     SHOW_NAMES is off.
     """
@@ -728,7 +739,7 @@ def _draw_name_label(
         return
     draw = ImageDraw.Draw(canvas)
     text = LABEL_DELIMITER.join(names)
-    max_text_w = slot_w - 2 * LABEL_PADDING
+    max_text_w = slot_w - 2 * LABEL_PADDING_X
 
     # Truncate with ellipsis if the joined names overflow the slot. Strip any
     # characters from the delimiter when tidying the tail so we don't end up
@@ -747,8 +758,8 @@ def _draw_name_label(
     metrics = getattr(_LABEL_FONT, "getmetrics", lambda: (12, 2))()
     th = metrics[0] + metrics[1]
 
-    rect_w = int(tw) + 2 * LABEL_PADDING
-    rect_h = th + 2 * LABEL_PADDING
+    rect_w = int(tw) + 2 * LABEL_PADDING_X
+    rect_h = th + 2 * LABEL_PADDING_Y
 
     # Pin the label rectangle to the requested corner of the slot. No outside
     # margin — the label sits flush against the slot edge.
@@ -768,7 +779,7 @@ def _draw_name_label(
         fill=(255, 255, 255),
     )
     draw.text(
-        (rect_x + LABEL_PADDING, rect_y + LABEL_PADDING - 1),
+        (rect_x + LABEL_PADDING_X, rect_y + LABEL_PADDING_Y - 1),
         text,
         fill=(0, 0, 0),
         font=_LABEL_FONT,
