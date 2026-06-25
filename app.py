@@ -529,12 +529,26 @@ def _draw_name_label(canvas: Image.Image, names: list[str], slot_x: int, slot_y:
     draw.text((rect_x + LABEL_PADDING_X, rect_y + LABEL_PADDING_Y - 1), text, fill=(0, 0, 0), font=_LABEL_FONT)
 
 
+def _get_year(asset: dict) -> str:
+    # Fallback cascade to get the date string safely
+    dt_str = asset.get("fileCreatedAt") or asset.get("exifInfo", {}).get("dateTimeOriginal") or ""
+    return dt_str[:4] if len(dt_str) >= 4 and dt_str[:4].isdigit() else ""
+
+
 def _compose_canvas(sources: list[Image.Image], layout: str, assets: list[dict]) -> Image.Image:
     canvas = Image.new("RGB", (CANVAS_W, CANVAS_H), (255, 255, 255))
+
     if layout == "single":
         assert len(sources) == 1 and len(assets) == 1
         canvas.paste(_fit_to_slot(sources[0], assets[0]["id"], CANVAS_W, CANVAS_H), (0, 0))
-        _draw_name_label(canvas, _asset_names(assets[0]), 0, 0, CANVAS_W, CANVAS_H)
+
+        # Merge names and year
+        label_elements = _asset_names(assets[0])
+        year = _get_year(assets[0])
+        if year:
+            label_elements.append(year)
+
+        _draw_name_label(canvas, label_elements, 0, 0, CANVAS_W, CANVAS_H)
         return canvas
 
     assert layout == "duo" and len(sources) == 2 and len(assets) == 2
@@ -542,14 +556,41 @@ def _compose_canvas(sources: list[Image.Image], layout: str, assets: list[dict])
         slot_w, slot_h = CANVAS_W // 2, CANVAS_H
         canvas.paste(_fit_to_slot(sources[0], assets[0]["id"], slot_w, slot_h), (0, 0))
         canvas.paste(_fit_to_slot(sources[1], assets[1]["id"], slot_w, slot_h), (slot_w, 0))
-        _draw_name_label(canvas, _asset_names(assets[0]), 0, 0, slot_w, slot_h)
-        _draw_name_label(canvas, _asset_names(assets[1]), slot_w, 0, slot_w, slot_h)
+
+        # Build layout elements for asset 0
+        lbl0 = _asset_names(assets[0])
+        yr0 = _get_year(assets[0])
+        if yr0:
+            lbl0.append(yr0)
+
+        # Build layout elements for asset 1
+        lbl1 = _asset_names(assets[1])
+        yr1 = _get_year(assets[1])
+        if yr1:
+            lbl1.append(yr1)
+
+        _draw_name_label(canvas, lbl0, 0, 0, slot_w, slot_h)
+        _draw_name_label(canvas, lbl1, slot_w, 0, slot_w, slot_h)
     else:
         slot_w, slot_h = CANVAS_W, CANVAS_H // 2
         canvas.paste(_fit_to_slot(sources[0], assets[0]["id"], slot_w, slot_h), (0, 0))
         canvas.paste(_fit_to_slot(sources[1], assets[1]["id"], slot_w, slot_h), (0, slot_h))
-        _draw_name_label(canvas, _asset_names(assets[0]), 0, 0, slot_w, slot_h)
-        _draw_name_label(canvas, _asset_names(assets[1]), 0, slot_h, slot_w, slot_h)
+
+        # Build layout elements for asset 0
+        lbl0 = _asset_names(assets[0])
+        yr0 = _get_year(assets[0])
+        if yr0:
+            lbl0.append(yr0)
+
+        # Build layout elements for asset 1
+        lbl1 = _asset_names(assets[1])
+        yr1 = _get_year(assets[1])
+        if yr1:
+            lbl1.append(yr1)
+
+        _draw_name_label(canvas, lbl0, 0, 0, slot_w, slot_h)
+        _draw_name_label(canvas, lbl1, 0, slot_h, slot_w, slot_h)
+
     return canvas
 
 
