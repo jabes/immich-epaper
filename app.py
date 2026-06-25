@@ -251,21 +251,28 @@ def _smart_face_fit(img: Image.Image, asset_id: str, target_w: int, target_h: in
         return _center_fit(img, target_w, target_h)
 
     img_w, img_h = img.size
-    x_coords = []
-    y_coords = []
+    x_coords: list[float] = []
+    y_coords: list[float] = []
 
     for face in faces:
-        box = face.get("boundingBox")
-        if box:
-            # Check for standard x1/x2, or fallback to camelCase variations xMin/xMax
-            x1 = box.get("x1") if box.get("x1") is not None else box.get("xMin")
-            x2 = box.get("x2") if box.get("x2") is not None else box.get("xMax")
-            y1 = box.get("y1") if box.get("y1") is not None else box.get("yMin")
-            y2 = box.get("y2") if box.get("y2") is not None else box.get("yMax")
+        x1 = face.get("boundingBoxX1")
+        y1 = face.get("boundingBoxY1")
+        x2 = face.get("boundingBoxX2")
+        y2 = face.get("boundingBoxY2")
+        face_img_w = face.get("imageWidth")
+        face_img_h = face.get("imageHeight")
 
-            if None not in (x1, x2, y1, y2):
-                x_coords.extend([float(x1) * img_w, float(x2) * img_w])
-                y_coords.extend([float(y1) * img_h, float(y2) * img_h])
+        if x1 is None or y1 is None or x2 is None or y2 is None:
+            continue
+        if not face_img_w or not face_img_h:
+            continue
+
+        # Scale from face-model pixel space -> our fetched image's pixel space
+        sx = img_w / float(face_img_w)
+        sy = img_h / float(face_img_h)
+
+        x_coords.extend([float(x1) * sx, float(x2) * sx])
+        y_coords.extend([float(y1) * sy, float(y2) * sy])
 
     if not x_coords or not y_coords:
         log.info("crop: no coordinates found for %s, falling back to center", asset_id)
