@@ -219,6 +219,7 @@ _PAL_IMG = _build_palette_image()
 # Image Geometry & Face-Aware Cropping Logic
 # ---------------------------------------------------------------------------
 def _center_fit(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
+    log.info("crop: center fit (%dx%d -> %dx%d)", img.width, img.height, target_w, target_h)
     return ImageOps.fit(img, (target_w, target_h), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
 
 
@@ -256,10 +257,18 @@ def _smart_face_fit(img: Image.Image, asset_id: str, target_w: int, target_h: in
     for face in faces:
         box = face.get("boundingBox")
         if box:
-            x_coords.extend([box["x1"] * img_w, box["x2"] * img_w])
-            y_coords.extend([box["y1"] * img_h, box["y2"] * img_h])
+            # Check for standard x1/x2, or fallback to camelCase variations xMin/xMax
+            x1 = box.get("x1") if box.get("x1") is not None else box.get("xMin")
+            x2 = box.get("x2") if box.get("x2") is not None else box.get("xMax")
+            y1 = box.get("y1") if box.get("y1") is not None else box.get("yMin")
+            y2 = box.get("y2") if box.get("y2") is not None else box.get("yMax")
+
+            if None not in (x1, x2, y1, y2):
+                x_coords.extend([float(x1) * img_w, float(x2) * img_w])
+                y_coords.extend([float(y1) * img_h, float(y2) * img_h])
 
     if not x_coords or not y_coords:
+        log.info("crop: no coordinates found for %s, falling back to center", asset_id)
         return _center_fit(img, target_w, target_h)
 
     # 1. Find the strict boundaries of the face cluster
