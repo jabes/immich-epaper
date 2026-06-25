@@ -14,17 +14,6 @@ import requests
 from flask import Flask, Response, request
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-# smartcrop – optional (fallback retained)
-try:
-    import smartcrop as _smartcrop
-
-    _SMARTCROP = _smartcrop.SmartCrop()
-    _SMARTCROP_ERROR = None
-except Exception as e:
-    _smartcrop = None
-    _SMARTCROP = None
-    _SMARTCROP_ERROR = e
-
 # ---------------------------------------------------------------------------
 # Panel definition (Authoritative epd7in3e / E6 values)
 # ---------------------------------------------------------------------------
@@ -91,8 +80,6 @@ if ASSET_ORIENTATION not in {"any", "landscape", "portrait", "square"}:
 CROP_MODE = os.environ.get("IMMICH_CROP", "center").strip().lower()
 if CROP_MODE not in {"center", "smart"}:
     raise SystemExit(f"IMMICH_CROP={CROP_MODE!r} must be center|smart")
-if CROP_MODE == "smart" and _SMARTCROP is None:
-    raise SystemExit(f"IMMICH_CROP=smart but smartcrop import failed: {_SMARTCROP_ERROR!r}")
 
 RANKING_BATCH = int(os.environ.get("IMMICH_RANKING_BATCH", "5"))
 QUALITY_ENABLED = os.environ.get("IMMICH_QUALITY_ENABLED", "true").lower() != "false"
@@ -123,9 +110,6 @@ if not log.handlers:
     log.addHandler(_h)
 
 logging.getLogger("urllib3").setLevel(logging.WARNING)
-
-if _SMARTCROP is None and _SMARTCROP_ERROR is not None:
-    log.info("smartcrop unavailable (%r); IMMICH_CROP=smart will be rejected", _SMARTCROP_ERROR)
 
 log.info("Quality scoring enabled (pyiqa NIMA, BRISQUE, sharpness)")
 
@@ -232,36 +216,104 @@ _PAL_IMG = _build_palette_image()
 
 
 # ---------------------------------------------------------------------------
-# Image Geometry & Cropping Logic
+# Image Geometry & Face-Aware Cropping Logic
 # ---------------------------------------------------------------------------
 def _center_fit(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
     return ImageOps.fit(img, (target_w, target_h), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
 
 
-def _smart_fit(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
-    if img.width < target_w or img.height < target_h:
-        log.info("crop: source %dx%d smaller than %dx%d, falling back to center", img.width, img.height, target_w, target_h)
-        return _center_fit(img, target_w, target_h)
+def _get_asset_faces(asset_id: str) -> list[dict]:
+    """Fetch detailed asset metadata to extract native face bounding boxes."""
     try:
-        assert _SMARTCROP is not None
-        scale = min(1.0, 1024 / max(img.width, img.height))
-        scored = img.resize((int(img.width * scale), int(img.height * scale)), Image.Resampling.LANCZOS) if scale < 1.0 else img
-
-        result = _SMARTCROP.crop(scored, target_w, target_h)
-        c = result["top_crop"]
-        x, y, w, h = c["x"], c["y"], c["width"], c["height"]
-        inv = 1.0 / scale
-        box = (int(x * inv), int(y * inv), int((x + w) * inv), int((y + h) * inv))
-
-        log.info("crop: smart picked %s -> %dx%d from %dx%d", box, target_w, target_h, img.width, img.height)
-        return img.crop(box).resize((target_w, target_h), Image.Resampling.LANCZOS)
+        r = requests.get(f"{IMMICH_URL}/api/assets/{asset_id}", headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        return r.json().get("faces", [])
     except Exception as e:
-        log.warning("crop: smartcrop failed (%s), falling back to center", e)
+        log.warning("Failed to fetch face details for asset %s: %s", asset_id, e)
+        return []
+
+
+def _smart_face_fit(img: Image.Image, asset_id: str, target_w: int, target_h: int) -> Image.Image:
+    """Aesthetic face-aware cropping that preserves background context."""
+    faces = _get_asset_faces(asset_id)
+    if not faces:
+        log.info("crop: no faces returned for %s, falling back to center", asset_id)
         return _center_fit(img, target_w, target_h)
 
+    img_w, img_h = img.size
+    x_coords = []
+    y_coords = []
 
-def _fit_to_slot(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
-    return (_smart_fit if CROP_MODE == "smart" else _center_fit)(img, target_w, target_h)
+    for face in faces:
+        box = face.get("boundingBox")
+        if box:
+            x_coords.extend([box["x1"] * img_w, box["x2"] * img_w])
+            y_coords.extend([box["y1"] * img_h, box["y2"] * img_h])
+
+    if not x_coords or not y_coords:
+        return _center_fit(img, target_w, target_h)
+
+    # 1. Find the strict boundaries of the face cluster
+    f_min_x, f_max_x = min(x_coords), max(x_coords)
+    f_min_y, f_max_y = min(y_coords), max(y_coords)
+
+    f_w = f_max_x - f_min_x
+    f_h = f_max_y - f_min_y
+    f_center_x = f_min_x + (f_w / 2)
+    f_center_y = f_min_y + (f_h / 2)
+
+    # 2. Define our target aspect ratio
+    target_aspect = target_w / target_h
+
+    # 3. Figure out the minimum crop box size needed to include faces + context
+    # We want the crop box to be at least 2.5x the size of the face cluster
+    # so we don't get tight, awkward passport-photo crops.
+    PADDING_MULTIPLIER = 2.5
+
+    desired_w = f_w * PADDING_MULTIPLIER
+    desired_h = f_h * PADDING_MULTIPLIER
+
+    # Adjust desired dimensions to lock into the target aspect ratio
+    if desired_w / target_aspect > desired_h:
+        desired_h = desired_w / target_aspect
+    else:
+        desired_w = desired_h * target_aspect
+
+    # 4. Cap the crop box size so it doesn't exceed the actual image size
+    # If our padded box is too big for the photo, we scale it down to maximize the image use.
+    scale = min(1.0, img_w / desired_w, img_h / desired_h)
+    crop_w = int(desired_w * scale)
+    crop_h = int(desired_h * scale)
+
+    # 5. If the image is vast and the faces are tiny, don't zoom in to a tiny
+    # pixelated box. Ensure the crop covers at least 60% of the original photo's short edge.
+    min_short_edge = min(img_w, img_h) * 0.60
+    if crop_w / target_aspect < min_short_edge or crop_h < min_short_edge:
+        # Re-calculate box based on our fallback minimum background coverage rule
+        if img_w / target_aspect > img_h:
+            crop_h = int(img_h)
+            crop_w = int(crop_h * target_aspect)
+        else:
+            crop_w = int(img_w)
+            crop_h = int(crop_w / target_aspect)
+
+    # 6. Center our calculated canvas frame over the face group center
+    left = int(f_center_x - (crop_w / 2))
+    top = int(f_center_y - (crop_h / 2))
+
+    # 7. Final Safety Guard: Shift the box if it's spilling out of bounds
+    left = max(0, min(left, img_w - crop_w))
+    top = max(0, min(top, img_h - crop_h))
+
+    log.info("crop: aesthetic face-aware crop frame picked (%d, %d, %d, %d) for asset %s", left, top, left + crop_w, top + crop_h, asset_id)
+
+    return img.crop((left, top, left + crop_w, top + crop_h)).resize((target_w, target_h), Image.Resampling.LANCZOS)
+
+
+def _fit_to_slot(img: Image.Image, asset_id: str, target_w: int, target_h: int) -> Image.Image:
+    if CROP_MODE == "smart":
+        return _smart_face_fit(img, asset_id, target_w, target_h)
+    return _center_fit(img, target_w, target_h)
 
 
 # ---------------------------------------------------------------------------
@@ -463,21 +515,21 @@ def _compose_canvas(sources: list[Image.Image], layout: str, assets: list[dict])
     canvas = Image.new("RGB", (CANVAS_W, CANVAS_H), (255, 255, 255))
     if layout == "single":
         assert len(sources) == 1 and len(assets) == 1
-        canvas.paste(_fit_to_slot(sources[0], CANVAS_W, CANVAS_H), (0, 0))
+        canvas.paste(_fit_to_slot(sources[0], assets[0]["id"], CANVAS_W, CANVAS_H), (0, 0))
         _draw_name_label(canvas, _asset_names(assets[0]), 0, 0, CANVAS_W, CANVAS_H)
         return canvas
 
     assert layout == "duo" and len(sources) == 2 and len(assets) == 2
     if DEVICE_ORIENTATION == "landscape":
         slot_w, slot_h = CANVAS_W // 2, CANVAS_H
-        canvas.paste(_fit_to_slot(sources[0], slot_w, slot_h), (0, 0))
-        canvas.paste(_fit_to_slot(sources[1], slot_w, slot_h), (slot_w, 0))
+        canvas.paste(_fit_to_slot(sources[0], assets[0]["id"], slot_w, slot_h), (0, 0))
+        canvas.paste(_fit_to_slot(sources[1], assets[1]["id"], slot_w, slot_h), (slot_w, 0))
         _draw_name_label(canvas, _asset_names(assets[0]), 0, 0, slot_w, slot_h)
         _draw_name_label(canvas, _asset_names(assets[1]), slot_w, 0, slot_w, slot_h)
     else:
         slot_w, slot_h = CANVAS_W, CANVAS_H // 2
-        canvas.paste(_fit_to_slot(sources[0], slot_w, slot_h), (0, 0))
-        canvas.paste(_fit_to_slot(sources[1], slot_w, slot_h), (0, slot_h))
+        canvas.paste(_fit_to_slot(sources[0], assets[0]["id"], slot_w, slot_h), (0, 0))
+        canvas.paste(_fit_to_slot(sources[1], assets[1]["id"], slot_w, slot_h), (0, slot_h))
         _draw_name_label(canvas, _asset_names(assets[0]), 0, 0, slot_w, slot_h)
         _draw_name_label(canvas, _asset_names(assets[1]), 0, slot_h, slot_w, slot_h)
     return canvas
