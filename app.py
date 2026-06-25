@@ -223,18 +223,27 @@ def _center_fit(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
 
 
 def _get_asset_faces(asset_id: str) -> list[dict]:
-    """Fetch detailed asset metadata to extract native face bounding boxes."""
     try:
         r = requests.get(f"{IMMICH_URL}/api/assets/{asset_id}", headers=HEADERS, timeout=15)
         r.raise_for_status()
-        return r.json().get("faces", [])
+        data = r.json()
+        extracted_faces = []
+        # 1. Extract faces tied to assigned/named people
+        for person in data.get("people", []) or []:
+            # Immich nesting: each person object can contain a list of face objects
+            faces = person.get("faces", []) or []
+            extracted_faces.extend(faces)
+        # 2. Extract faces that are detected but unassigned
+        unassigned = data.get("unassignedFaces", []) or []
+        extracted_faces.extend(unassigned)
+        log.info("found %d face(s) for asset %s", len(extracted_faces), asset_id)
+        return extracted_faces
     except Exception as e:
         log.warning("Failed to fetch face details for asset %s: %s", asset_id, e)
         return []
 
 
 def _smart_face_fit(img: Image.Image, asset_id: str, target_w: int, target_h: int) -> Image.Image:
-    """Aesthetic face-aware cropping that preserves background context."""
     faces = _get_asset_faces(asset_id)
     if not faces:
         log.info("crop: no faces returned for %s, falling back to center", asset_id)
@@ -625,8 +634,6 @@ def _composite_score(img: Image.Image) -> float:
 # Core Layout Matrix Builder (Returns clean unquantized RGB canvas)
 # ---------------------------------------------------------------------------
 def _build_frame() -> tuple[str, str, Image.Image]:
-    """Generates the optimal layout and returns a crisp unquantized final composition.
-    Returns tuple of (composite_id, layout_type, final_unquantized_canvas_object)."""
     layout = _pick_layout()
     log.info("build: layout=%s (device=%s, duo_prob=%.2f)", layout, DEVICE_ORIENTATION, DUO_PROBABILITY)
 
