@@ -45,6 +45,13 @@ Config via environment:
                               its job. Set this only if you want to force "always
                               landscape" or similar — it bypasses the duo logic.
 
+  Labels (drawn on top of each slot, before quantization so the text stays crisp):
+  IMMICH_SHOW_NAMES         true (default) | false. Draw person names at the top
+                            of each slot in black text on a white rectangle.
+                            Requires Immich face recognition to have run.
+  IMMICH_LABEL_FONT_SIZE    px, default 18. Scales DejaVu Sans Bold (provided
+                            by fonts-dejavu-core in the image).
+
   Kiosk-style filters (apply to the search path, i.e. when IMMICH_ALBUM_ID is unset;
   EXCLUDE_PEOPLE also applies in album mode):
   IMMICH_INCLUDE_PEOPLE     comma-separated person UUIDs to include
@@ -77,7 +84,7 @@ import numpy as np
 import pyiqa
 import requests
 from flask import Flask, Response, request
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 # smartcrop – optional (we keep the existing fallback)
 try:
@@ -115,6 +122,10 @@ PALETTE_RGB = [
     (45, 65, 170),  # blue
     (35, 130, 75),  # green
 ]
+
+# Map palette indices (0..5) to the 4-bit colour codes used by the E6 panel.
+# The panel's colour order is: black, white, yellow, red, blue, green.
+# Note the gap: 0x4 is unused on this panel (it was orange on the older 7‑colour "F" panel).
 CODE_LUT = np.array([0x0, 0x1, 0x2, 0x3, 0x5, 0x6], dtype=np.uint8)
 
 IMMICH_URL = os.environ.get("IMMICH_URL", "http://immich-server:2283").rstrip("/")
@@ -206,6 +217,14 @@ if CROP_MODE == "smart" and _SMARTCROP is None:
 RANKING_BATCH = int(os.environ.get("IMMICH_RANKING_BATCH", "5"))
 QUALITY_ENABLED = os.environ.get("IMMICH_QUALITY_ENABLED", "true").lower() != "false"
 
+# Name-label settings. Labels are drawn into each slot on the RGB canvas BEFORE
+# quantization so the text renders crisply (black/white quantize cleanly to the
+# panel's actual black/white; if drawn after dithering, the text edges would
+# pick up rainbow speckles from surrounding pixels).
+SHOW_NAMES = os.environ.get("IMMICH_SHOW_NAMES", "true").lower() != "false"
+LABEL_FONT_SIZE = int(os.environ.get("IMMICH_LABEL_FONT_SIZE", "18"))
+LABEL_PADDING = 6  # px around text inside the white pill
+
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 _level = getattr(logging, LOG_LEVEL, logging.INFO)
 
@@ -234,6 +253,29 @@ if _SMARTCROP is None and _SMARTCROP_ERROR is not None:
     )
 
 log.info("Quality scoring enabled (pyiqa NIMA, BRISQUE, sharpness)")
+
+
+def _load_font(size: int):
+    """DejaVu Sans is present on python:3.x-slim if fonts-dejavu-core is
+    installed (apt-get install -y fonts-dejavu-core in the Dockerfile). Falls
+    back to Pillow's bitmap default if missing — text will look bad but the
+    pipeline keeps working rather than failing the whole request."""
+    for path in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ):
+        try:
+            return ImageFont.truetype(path, size)
+        except (OSError, IOError):
+            continue
+    log.warning(
+        "DejaVu font not found; using Pillow default (text will look bad). "
+        "Add `fonts-dejavu-core` to the Dockerfile."
+    )
+    return ImageFont.load_default()
+
+
+_LABEL_FONT = _load_font(LABEL_FONT_SIZE)
 
 HEADERS = {"x-api-key": API_KEY, "Accept": "application/json"}
 
@@ -283,6 +325,8 @@ def _log_startup_config() -> None:
         ("IMMICH_ASSET_ORIENTATION", ASSET_ORIENTATION),
         ("IMMICH_CROP", CROP_MODE),
         ("IMMICH_DITHER", DITHER_ENABLED),
+        ("IMMICH_SHOW_NAMES", SHOW_NAMES),
+        ("IMMICH_LABEL_FONT_SIZE", LABEL_FONT_SIZE),
         ("FRAME_ROTATE", ROTATE),
         ("LOG_LEVEL", LOG_LEVEL),
         ("IMMICH_RANKING_BATCH", RANKING_BATCH),
@@ -429,13 +473,29 @@ def _shape_matches(asset: dict, target: str) -> bool:
     return shape == target
 
 
+def _asset_names(asset: dict) -> list[str]:
+    """Return non-empty person names from the asset, deduped, preserving the
+    order Immich returns them. Immich includes unnamed face clusters with empty
+    name strings; skip those rather than rendering "Anna, , , Henry"."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in asset.get("people", []) or []:
+        name = (p.get("name") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
 def _search_body() -> dict:
     body: dict = {
         "type": "IMAGE",
         "size": max(1, min(SEARCH_BATCH, 1000)),
         "withArchived": False,
-        # needed so we can apply exclude_people locally
-        "withPeople": bool(EXCLUDE_PEOPLE),
+        # Always request people: needed to draw name labels on slots, and the
+        # cost is negligible (Immich already has them indexed).
+        "withPeople": True,
         # Always request EXIF: even when ASSET_ORIENTATION='any', the duo picker
         # needs display dims to classify candidates.
         "withExif": True,
@@ -493,11 +553,12 @@ def _pick_asset(shape: str, exclude_ids: set[str] | None = None) -> dict:
             raise RuntimeError(f"album has no matching {shape} assets")
         chosen = random.choice(assets)
         log.info(
-            "pick(%s): chose %s (%s) %s  %s/photos/%s",
+            "pick(%s): chose %s (%s) %s names=%s  %s/photos/%s",
             shape,
             chosen["id"],
             chosen.get("originalFileName", "?"),
             _asset_display_dims(chosen),
+            _asset_names(chosen) or "(none)",
             IMMICH_PUBLIC_URL,
             chosen["id"],
         )
@@ -528,11 +589,12 @@ def _pick_asset(shape: str, exclude_ids: set[str] | None = None) -> dict:
         raise RuntimeError(f"no {shape} assets matched the configured filters")
     chosen = random.choice(assets)
     log.info(
-        "pick(%s): chose %s (%s) %s  %s/photos/%s",
+        "pick(%s): chose %s (%s) %s names=%s  %s/photos/%s",
         shape,
         chosen["id"],
         chosen.get("originalFileName", "?"),
         _asset_display_dims(chosen),
+        _asset_names(chosen) or "(none)",
         IMMICH_PUBLIC_URL,
         chosen["id"],
     )
@@ -581,8 +643,61 @@ def _pick_layout() -> str:
     return "duo" if random.random() < DUO_PROBABILITY else "single"
 
 
-def _compose_canvas(sources: list[Image.Image], layout: str) -> Image.Image:
-    """Build the final RGB canvas (CANVAS_W x CANVAS_H) before rotation and quantization.
+def _draw_name_label(
+    canvas: Image.Image,
+    names: list[str],
+    slot_x: int,
+    slot_y: int,
+    slot_w: int,
+) -> None:
+    """Draw "Name, Name, Name" at the top of a slot. Black text on a white
+    rectangle, padded LABEL_PADDING. Truncates with an ellipsis if the joined
+    string doesn't fit in slot_w. No-op if names is empty or SHOW_NAMES is off.
+    """
+    if not names or not SHOW_NAMES:
+        return
+    draw = ImageDraw.Draw(canvas)
+    text = ", ".join(names)
+    max_text_w = slot_w - 2 * LABEL_PADDING
+
+    # Truncate with ellipsis if the joined names overflow the slot.
+    if draw.textlength(text, font=_LABEL_FONT) > max_text_w:
+        ell = "…"
+        while text and draw.textlength(text + ell, font=_LABEL_FONT) > max_text_w:
+            text = text[:-1]
+        text = text.rstrip(", ") + ell
+
+    tw = draw.textlength(text, font=_LABEL_FONT)
+    # ascent+descent gives a tighter, more predictable label box than textbbox
+    # for short labels.
+    try:
+        ascent, descent = _LABEL_FONT.getmetrics()
+        th = ascent + descent
+    except AttributeError:
+        th = 14  # Pillow's bitmap default lacks getmetrics
+
+    rect_w = int(tw) + 2 * LABEL_PADDING
+    rect_h = th + 2 * LABEL_PADDING
+    rect_x = slot_x + (slot_w - rect_w) // 2
+    rect_y = slot_y
+    draw.rectangle(
+        (rect_x, rect_y, rect_x + rect_w, rect_y + rect_h),
+        fill=(255, 255, 255),
+    )
+    draw.text(
+        (rect_x + LABEL_PADDING, rect_y + LABEL_PADDING - 1),
+        text,
+        fill=(0, 0, 0),
+        font=_LABEL_FONT,
+    )
+
+
+def _compose_canvas(
+    sources: list[Image.Image], layout: str, assets: list[dict]
+) -> Image.Image:
+    """Build the final RGB canvas (CANVAS_W x CANVAS_H) before rotation and
+    quantization. The `assets` argument is parallel to `sources` and supplies
+    the names used for per-slot labels.
 
     layout='single': one source filling the entire canvas.
     layout='duo': two sources split along the canvas's *long* axis. For a
@@ -591,22 +706,27 @@ def _compose_canvas(sources: list[Image.Image], layout: str) -> Image.Image:
     """
     canvas = Image.new("RGB", (CANVAS_W, CANVAS_H), (255, 255, 255))
     if layout == "single":
-        assert len(sources) == 1
+        assert len(sources) == 1 and len(assets) == 1
         canvas.paste(_fit_to_slot(sources[0], CANVAS_W, CANVAS_H), (0, 0))
+        _draw_name_label(canvas, _asset_names(assets[0]), 0, 0, CANVAS_W)
         return canvas
 
-    assert layout == "duo" and len(sources) == 2
+    assert layout == "duo" and len(sources) == 2 and len(assets) == 2
     if DEVICE_ORIENTATION == "landscape":
         # Two portrait slots side-by-side. Splitting 800 in two gives 400-wide
         # slots; if you ever want a gap between, subtract a margin here.
         slot_w, slot_h = CANVAS_W // 2, CANVAS_H
         canvas.paste(_fit_to_slot(sources[0], slot_w, slot_h), (0, 0))
         canvas.paste(_fit_to_slot(sources[1], slot_w, slot_h), (slot_w, 0))
+        _draw_name_label(canvas, _asset_names(assets[0]), 0, 0, slot_w)
+        _draw_name_label(canvas, _asset_names(assets[1]), slot_w, 0, slot_w)
     else:
         # Two landscape slots stacked vertically.
         slot_w, slot_h = CANVAS_W, CANVAS_H // 2
         canvas.paste(_fit_to_slot(sources[0], slot_w, slot_h), (0, 0))
         canvas.paste(_fit_to_slot(sources[1], slot_w, slot_h), (0, slot_h))
+        _draw_name_label(canvas, _asset_names(assets[0]), 0, 0, slot_w)
+        _draw_name_label(canvas, _asset_names(assets[1]), 0, slot_h, slot_w)
     return canvas
 
 
@@ -645,11 +765,13 @@ def _pack_canvas(canvas: Image.Image) -> tuple[bytes, bytes, bytes]:
     return packed, png_buf.getvalue(), jpg_buf.getvalue()
 
 
-def _process(sources: list[Image.Image], layout: str) -> tuple[bytes, bytes, bytes]:
-    """Legacy wrapper: compose, rotate, pack, and return (packed, png, jpg)."""
+def _process(
+    sources: list[Image.Image], assets: list[dict], layout: str
+) -> tuple[bytes, bytes, bytes]:
+    """Compose, rotate, pack, and return (packed, png, jpg)."""
     t0 = time.monotonic()
     sources = [_normalize_source(s) for s in sources]
-    canvas = _compose_canvas(sources, layout)
+    canvas = _compose_canvas(sources, layout, assets)
     canvas = _rotate_final_canvas(canvas)
     packed, png, jpg = _pack_canvas(canvas)
 
@@ -757,7 +879,7 @@ def _build_frame() -> dict:
         else:
             assets = [_pick_asset(SINGLE_SHAPE)]
         sources = [_fetch_image(a["id"]) for a in assets]
-        packed, png, jpg = _process(sources, layout)
+        packed, png, jpg = _process(sources, assets, layout)
         composite_id = "+".join(a["id"] for a in assets)
         return {
             "id": composite_id,
@@ -784,10 +906,16 @@ def _build_frame() -> dict:
                 assets = [_pick_asset(SINGLE_SHAPE)]
             # Fetch and compose
             sources = [_fetch_image(a["id"]) for a in assets]
-            # Compose and rotate to final canvas (before quantization)
-            canvas = _compose_canvas([_normalize_source(s) for s in sources], layout)
+            # Compose (with labels) and rotate to final canvas, before quantization
+            canvas = _compose_canvas(
+                [_normalize_source(s) for s in sources], layout, assets
+            )
             canvas = _rotate_final_canvas(canvas)
-            # Score the RGB canvas
+            # Score the RGB canvas. NB: scoring runs against the labelled canvas,
+            # so quality models see the white label pills too. This shifts scores
+            # a touch (NIMA may like the clean whitespace; BRISQUE may not love
+            # the hard rectangle edges) but the bias is consistent across all
+            # candidates, so the ranking order is preserved.
             score = _composite_score(canvas)
             log.info(
                 "candidate %d: score=%.4f (assets: %s)",
@@ -807,7 +935,7 @@ def _build_frame() -> dict:
         # Ultimate fallback: pick one random asset (single)
         assets = [_pick_asset(SINGLE_SHAPE)]
         sources = [_fetch_image(a["id"]) for a in assets]
-        packed, png, jpg = _process(sources, "single")
+        packed, png, jpg = _process(sources, assets, "single")
         composite_id = assets[0]["id"]
         return {
             "id": composite_id,
