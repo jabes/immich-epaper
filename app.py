@@ -50,8 +50,15 @@ Config via environment:
                             corner of each slot in black text on a white
                             rectangle. Requires Immich face recognition to
                             have run.
-  IMMICH_LABEL_FONT_SIZE    px, default 18. Scales DejaVu Sans Bold (provided
-                            by fonts-dejavu-core in the image).
+  IMMICH_LABEL_FONT_SIZE    px, default 18.
+  IMMICH_LABEL_FONT         font filename (no path, no extension), default
+                            "DejaVuSans-Bold". Looked up under
+                            /usr/share/fonts/truetype/dejavu/. With
+                            fonts-dejavu installed you also get
+                            DejaVuSans-{Oblique,BoldOblique,ExtraLight},
+                            DejaVuSansCondensed-*, DejaVuSansMono-*, and the
+                            DejaVuSerif-* family. Falls back to Bold then
+                            Regular if the requested font isn't found.
   IMMICH_LABEL_CORNER       top-left | top-middle | top-right |
                             bottom-left | bottom-middle | bottom-right (default).
                             In duo layouts, the position is relative to the SLOT,
@@ -255,6 +262,13 @@ FIRST_NAME_ONLY = os.environ.get("IMMICH_FIRST_NAME_ONLY", "true").lower() != "f
 # Any string is accepted; surrounding whitespace is preserved verbatim from
 # the env var so you can control padding (e.g. "-" with no spaces).
 LABEL_DELIMITER = os.environ.get("IMMICH_LABEL_DELIMITER", " - ")
+# Font filename (no path, no extension). Looked up under the standard DejaVu
+# install dir on Debian. Some valid values:
+#   DejaVuSans, DejaVuSans-Bold, DejaVuSans-BoldOblique, DejaVuSans-ExtraLight,
+#   DejaVuSans-Oblique, DejaVuSansCondensed, DejaVuSansCondensed-Bold, ...
+#   DejaVuSansMono, DejaVuSansMono-Bold, ...
+#   DejaVuSerif, DejaVuSerif-Bold, DejaVuSerif-BoldItalic, ...
+LABEL_FONT = os.environ.get("IMMICH_LABEL_FONT", "DejaVuSans-Bold").strip()
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 _level = getattr(logging, LOG_LEVEL, logging.INFO)
@@ -287,21 +301,30 @@ log.info("Quality scoring enabled (pyiqa NIMA, BRISQUE, sharpness)")
 
 
 def _load_font(size: int):
-    """DejaVu Sans is present on python:3.x-slim if fonts-dejavu-core is
-    installed (apt-get install -y fonts-dejavu-core in the Dockerfile). Falls
-    back to Pillow's bitmap default if missing — text will look bad but the
-    pipeline keeps working rather than failing the whole request."""
-    for path in (
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ):
+    """Load LABEL_FONT from the standard DejaVu install dir, falling back to
+    DejaVuSans-Bold, then DejaVuSans, then Pillow's bitmap default. The cascade
+    means a typo in IMMICH_LABEL_FONT logs a warning and keeps running with
+    something reasonable rather than rejecting the request."""
+    candidates = [LABEL_FONT, "DejaVuSans"]
+    tried: list[str] = []
+    for name in candidates:
+        path = f"/usr/share/fonts/truetype/dejavu/{name}.ttf"
+        tried.append(path)
         try:
-            return ImageFont.truetype(path, size)
+            font = ImageFont.truetype(path, size)
+            if name != LABEL_FONT:
+                log.warning(
+                    "IMMICH_LABEL_FONT=%r not found; using %r instead",
+                    LABEL_FONT,
+                    name,
+                )
+            return font
         except (OSError, IOError):
             continue
     log.warning(
-        "DejaVu font not found; using Pillow default (text will look bad). "
-        "Add `fonts-dejavu-core` to the Dockerfile."
+        "No DejaVu font found (tried %s); using Pillow default (text will look bad). "
+        "Add `fonts-dejavu-core` (or `fonts-dejavu` for the full set) to the Dockerfile.",
+        tried,
     )
     return ImageFont.load_default()
 
@@ -358,6 +381,7 @@ def _log_startup_config() -> None:
         ("IMMICH_DITHER", DITHER_ENABLED),
         ("IMMICH_SHOW_NAMES", SHOW_NAMES),
         ("IMMICH_LABEL_FONT_SIZE", LABEL_FONT_SIZE),
+        ("IMMICH_LABEL_FONT", LABEL_FONT),
         ("IMMICH_LABEL_CORNER", LABEL_CORNER),
         ("IMMICH_FIRST_NAME_ONLY", FIRST_NAME_ONLY),
         ("IMMICH_LABEL_DELIMITER", repr(LABEL_DELIMITER)),
