@@ -1125,5 +1125,32 @@ def healthz():
     return {"ok": True, "album_mode": bool(ALBUM_ID)}
 
 
+def _warmup_quality_models() -> None:
+    """Force pyiqa to download/load the NIMA and BRISQUE weights now, at module
+    import, so the first real frame request doesn't pay the 10-30 second cold-
+    start cost (and risk a gunicorn timeout). Runs synchronously — the worker
+    isn't ready until this returns. Skipped when QUALITY_ENABLED is false.
+
+    Uses a tiny placeholder image; the score we get is meaningless. The point
+    is just to materialise the model weights in memory.
+    """
+    if not QUALITY_ENABLED:
+        return
+    t0 = time.monotonic()
+    log.info("warmup: loading pyiqa NIMA + BRISQUE models...")
+    try:
+        dummy = Image.new("RGB", (224, 224), (128, 128, 128))
+        _get_nima_score(dummy)
+        _get_brisque_score(dummy)
+        log.info("warmup: models ready, took %.1f s", time.monotonic() - t0)
+    except Exception as e:
+        # Don't crash the worker on warmup failure — the models will retry lazily
+        # on first request, and pyiqa will surface the real error then.
+        log.warning("warmup: pyiqa preload failed (%s); models will load lazily", e)
+
+
+_warmup_quality_models()
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)

@@ -40,8 +40,8 @@ ENV PATH="/venv/bin:$PATH"
 ENV PYTHONUNBUFFERED=1
 
 # Preload models
-RUN python -c "import pyiqa; pyiqa.create_metric('nima');"
-RUN python -c "import pyiqa; pyiqa.create_metric('brisque');"
+# RUN python -c "import pyiqa; pyiqa.create_metric('nima');"
+# RUN python -c "import pyiqa; pyiqa.create_metric('brisque');"
 
 EXPOSE 8080
 CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--timeout", "300", "--capture-output", "--log-level", "info", "--access-logfile", "-", "--error-logfile", "-", "app:app"]
