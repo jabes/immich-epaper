@@ -309,6 +309,7 @@ def _pick_asset(shape: str, exclude_ids: set[str] | None = None) -> dict:
             return False
         return True
 
+    # 1. Album Mode
     if ALBUM_ID:
         r = requests.get(f"{IMMICH_URL}/api/albums/{ALBUM_ID}", headers=HEADERS, timeout=30)
         r.raise_for_status()
@@ -331,19 +332,39 @@ def _pick_asset(shape: str, exclude_ids: set[str] | None = None) -> dict:
         )
         return chosen
 
+    # 2. Search Mode (with automatic fallback tiering)
     body = _build_search_payload()
-    log.info("pick(%s): search/random body=%s", shape, body)
-    r = requests.post(f"{IMMICH_URL}/api/search/random", headers={**HEADERS, "Content-Type": "application/json"}, json=body, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    raw = data if isinstance(data, list) else data.get("assets", {}).get("items", [])
-    raw = [a for a in raw if a.get("type") == "IMAGE"]
+
+    for pass_num in ("strict", "fallback"):
+        if pass_num == "fallback":
+            log.warning("pick(%s): Strict filters returned 0 assets. Dropping constraints for a wide safety sweep.", shape)
+            body = {"type": "IMAGE", "size": 50, "withArchived": False, "withPeople": True, "withExif": True}
+
+        log.info("pick(%s): executing search (mode=%s)", shape, pass_num)
+        r = requests.post(f"{IMMICH_URL}/api/search/random", headers={**HEADERS, "Content-Type": "application/json"}, json=body, timeout=30)
+        r.raise_for_status()
+
+        data = r.json()
+        raw = data if isinstance(data, list) else data.get("assets", {}).get("items", [])
+        raw = [a for a in raw if a.get("type") == "IMAGE"]
+
+        if raw:
+            break
+    else:
+        raise RuntimeError("Immich instance returned zero total image assets during fallback search sweep.")
+
+    # 3. Apply Filters & Layout Shape Recovery
     after_excl = [a for a in raw if _is_asset_allowed(a) and a["id"] not in exclude_ids]
     assets = [a for a in after_excl if _shape_filter(a)]
-    log.info("pick(%s): search returned %d, %d after exclusion, %d after shape", shape, len(raw), len(after_excl), len(assets))
+
+    log.info("pick(%s): search returned %d, %d after exclusion, %d after shape.", shape, len(raw), len(after_excl), len(assets))
+
     if not assets:
-        raise RuntimeError(f"no {shape} assets matched the configured filters")
-    chosen = random.choice(assets)
+        log.warning("pick(%s): No assets matched shape constraint. Disregarding shape rules to preserve layout cycle.", shape)
+        chosen = random.choice(after_excl) if after_excl else random.choice(raw)
+    else:
+        chosen = random.choice(assets)
+
     log.info(
         "pick(%s): chose %s (%s) %s names=%s  %s/photos/%s",
         shape,
