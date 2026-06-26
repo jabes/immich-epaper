@@ -1,0 +1,51 @@
+services:
+  immich-epaper:
+    image: ghcr.io/jabes/immich-epaper:latest
+    container_name: immich-epaper
+    restart: unless-stopped
+    environment:
+      IMMICH_URL: "${IMMICH_URL}"
+      IMMICH_PUBLIC_URL: "${IMMICH_PUBLIC_URL}"
+      IMMICH_API_KEY: "${IMMICH_API_KEY}"
+      IMMICH_ALBUM_ID: "${IMMICH_ALBUM_ID}"
+      IMMICH_INCLUDE_PEOPLE: "${IMMICH_INCLUDE_PEOPLE}"
+      IMMICH_EXCLUDE_PEOPLE: "${IMMICH_EXCLUDE_PEOPLE}"
+      IMMICH_REQUIRE_ALL_PEOPLE: "${IMMICH_REQUIRE_ALL_PEOPLE}"
+      IMMICH_DATE_AFTER: "${IMMICH_DATE_AFTER}"
+      IMMICH_DATE_BEFORE: "${IMMICH_DATE_BEFORE}"
+      IMMICH_SEARCH_BATCH: "${IMMICH_SEARCH_BATCH}"
+      IMMICH_DEVICE_ORIENTATION: "${IMMICH_DEVICE_ORIENTATION}"
+      IMMICH_ASSET_ORIENTATION: "${IMMICH_ASSET_ORIENTATION}"
+      IMMICH_DUO_PROBABILITY: "${IMMICH_DUO_PROBABILITY}"
+      IMMICH_RANKING_BATCH: "${IMMICH_RANKING_BATCH}"
+      IMMICH_QUALITY_ENABLED: "${IMMICH_QUALITY_ENABLED}"
+      IMMICH_CROP: "${IMMICH_CROP}"
+      IMMICH_SHOW_NAMES: "${IMMICH_SHOW_NAMES}"
+      IMMICH_LABEL_FONT: "${IMMICH_LABEL_FONT}"
+      IMMICH_LABEL_FONT_SIZE: "${IMMICH_LABEL_FONT_SIZE}"
+      IMMICH_LABEL_PADDING_X: "${IMMICH_LABEL_PADDING_X}"
+      IMMICH_LABEL_PADDING_Y: "${IMMICH_LABEL_PADDING_Y}"
+      IMMICH_LABEL_DELIMITER: "${IMMICH_LABEL_DELIMITER}"
+      IMMICH_LABEL_CORNER: "${IMMICH_LABEL_CORNER}"
+      IMMICH_FIRST_NAME_ONLY: "${IMMICH_FIRST_NAME_ONLY}"
+      FRAME_ROTATE: "${FRAME_ROTATE}"
+      LOG_LEVEL: "${LOG_LEVEL}"
+    ports:
+      - "8080:8080"
+    networks:
+      - immich
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=10)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  immich:
+    external: true

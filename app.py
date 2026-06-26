@@ -82,9 +82,9 @@ RANKING_BATCH = int(os.environ.get("IMMICH_RANKING_BATCH", "5"))
 QUALITY_ENABLED = os.environ.get("IMMICH_QUALITY_ENABLED", "true").lower() != "false"
 
 SHOW_NAMES = os.environ.get("IMMICH_SHOW_NAMES", "true").lower() != "false"
-LABEL_FONT_SIZE = int(os.environ.get("IMMICH_LABEL_FONT_SIZE", "18"))
-LABEL_PADDING_X = int(os.environ.get("IMMICH_LABEL_PADDING_X", "4"))
-LABEL_PADDING_Y = int(os.environ.get("IMMICH_LABEL_PADDING_Y", "6"))
+LABEL_FONT_SIZE = int(os.environ.get("IMMICH_LABEL_FONT_SIZE", "12"))
+LABEL_PADDING_X = int(os.environ.get("IMMICH_LABEL_PADDING_X", "8"))
+LABEL_PADDING_Y = int(os.environ.get("IMMICH_LABEL_PADDING_Y", "4"))
 LABEL_CORNER = os.environ.get("IMMICH_LABEL_CORNER", "bottom-right").strip().lower()
 
 _VALID_CORNERS = {"top-left", "top-middle", "top-right", "bottom-left", "bottom-middle", "bottom-right"}
