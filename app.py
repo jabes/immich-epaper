@@ -20,8 +20,6 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 PANEL_W, PANEL_H = 800, 480  # The panel itself is always landscape-native
 FRAME_BYTES = PANEL_W * PANEL_H // 2  # 192000 bytes
 
-WIDTH, HEIGHT = PANEL_W, PANEL_H
-
 PALETTE_RGB = [
     (0, 0, 0),  # black
     (255, 255, 255),  # white
@@ -99,10 +97,10 @@ LABEL_DELIMITER = os.environ.get("IMMICH_LABEL_DELIMITER", " - ")
 LABEL_FONT = os.environ.get("IMMICH_LABEL_FONT", "DejaVuSans-Bold").strip()
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-_level = getattr(logging, LOG_LEVEL, logging.INFO)
+DEFAULT_LOG_LEVEL = getattr(logging, LOG_LEVEL, logging.INFO)
 
 log = logging.getLogger("immich-epaper")
-log.setLevel(_level)
+log.setLevel(DEFAULT_LOG_LEVEL)
 log.propagate = False
 if not log.handlers:
     _h = logging.StreamHandler(sys.stdout)
@@ -141,7 +139,7 @@ HEADERS = {"x-api-key": API_KEY, "Accept": "application/json"}
 # ---------------------------------------------------------------------------
 # Helper Utility Functions
 # ---------------------------------------------------------------------------
-def _iso(d: str, end_of_day: bool) -> str:
+def _resolve_api_date(d: str, end_of_day: bool) -> str:
     s = d.strip().lower()
     now = datetime.now(timezone.utc)
     edge = "T23:59:59.999Z" if end_of_day else "T00:00:00.000Z"
@@ -192,9 +190,9 @@ def _log_startup_config() -> None:
     for k, v in items:
         log.info("  %-26s = %s", k, v)
     if DATE_AFTER:
-        log.info("  -> takenAfter resolves to  %s", _iso(DATE_AFTER, end_of_day=False))
+        log.info("  -> takenAfter resolves to  %s", _resolve_api_date(DATE_AFTER, end_of_day=False))
     if DATE_BEFORE:
-        log.info("  -> takenBefore resolves to %s", _iso(DATE_BEFORE, end_of_day=True))
+        log.info("  -> takenBefore resolves to %s", _resolve_api_date(DATE_BEFORE, end_of_day=True))
 
 
 _log_startup_config()
@@ -212,7 +210,7 @@ def _build_palette_image() -> Image.Image:
     return pal
 
 
-_PAL_IMG = _build_palette_image()
+_QUANTIZATION_PALETTE = _build_palette_image()
 
 
 # ---------------------------------------------------------------------------
@@ -268,11 +266,11 @@ def _smart_face_fit(img: Image.Image, asset_id: str, target_w: int, target_h: in
             continue
 
         # Scale from face-model pixel space -> our fetched image's pixel space
-        sx = img_w / float(face_img_w)
-        sy = img_h / float(face_img_h)
+        scale_x = img_w / float(face_img_w)
+        scale_y = img_h / float(face_img_h)
 
-        x_coords.extend([float(x1) * sx, float(x2) * sx])
-        y_coords.extend([float(y1) * sy, float(y2) * sy])
+        x_coords.extend([float(x1) * scale_x, float(x2) * scale_x])
+        y_coords.extend([float(y1) * scale_y, float(y2) * scale_y])
 
     if not x_coords or not y_coords:
         log.info("crop: no coordinates found for %s, falling back to center", asset_id)
@@ -344,7 +342,7 @@ def _fit_to_slot(img: Image.Image, asset_id: str, target_w: int, target_h: int) 
 # ---------------------------------------------------------------------------
 # Immich Asset Validation & Processing
 # ---------------------------------------------------------------------------
-def _not_excluded(asset: dict) -> bool:
+def _is_asset_allowed(asset: dict) -> bool:
     if not EXCLUDE_PEOPLE:
         return True
     for p in asset.get("people", []):
@@ -400,7 +398,7 @@ def _asset_names(asset: dict) -> list[str]:
     return out
 
 
-def _search_body() -> dict:
+def _build_search_payload() -> dict:
     body = {
         "type": "IMAGE",
         "size": max(1, min(SEARCH_BATCH, 1000)),
@@ -409,9 +407,9 @@ def _search_body() -> dict:
         "withExif": True,
     }
     if DATE_AFTER:
-        body["takenAfter"] = _iso(DATE_AFTER, end_of_day=False)
+        body["takenAfter"] = _resolve_api_date(DATE_AFTER, end_of_day=False)
     if DATE_BEFORE:
-        body["takenBefore"] = _iso(DATE_BEFORE, end_of_day=True)
+        body["takenBefore"] = _resolve_api_date(DATE_BEFORE, end_of_day=True)
     if INCLUDE_PEOPLE:
         body["personIds"] = INCLUDE_PEOPLE if REQUIRE_ALL_PEOPLE else [random.choice(INCLUDE_PEOPLE)]
     return body
@@ -431,7 +429,7 @@ def _pick_asset(shape: str, exclude_ids: set[str] | None = None) -> dict:
         r = requests.get(f"{IMMICH_URL}/api/albums/{ALBUM_ID}", headers=HEADERS, timeout=30)
         r.raise_for_status()
         raw = [a for a in r.json().get("assets", []) if a.get("type") == "IMAGE"]
-        after_excl = [a for a in raw if _not_excluded(a) and a["id"] not in exclude_ids]
+        after_excl = [a for a in raw if _is_asset_allowed(a) and a["id"] not in exclude_ids]
         assets = [a for a in after_excl if _shape_filter(a)]
         log.info("pick(%s): album mode, %d images, %d after exclusion, %d after shape", shape, len(raw), len(after_excl), len(assets))
         if not assets:
@@ -449,14 +447,14 @@ def _pick_asset(shape: str, exclude_ids: set[str] | None = None) -> dict:
         )
         return chosen
 
-    body = _search_body()
+    body = _build_search_payload()
     log.info("pick(%s): search/random body=%s", shape, body)
     r = requests.post(f"{IMMICH_URL}/api/search/random", headers={**HEADERS, "Content-Type": "application/json"}, json=body, timeout=30)
     r.raise_for_status()
     data = r.json()
     raw = data if isinstance(data, list) else data.get("assets", {}).get("items", [])
     raw = [a for a in raw if a.get("type") == "IMAGE"]
-    after_excl = [a for a in raw if _not_excluded(a) and a["id"] not in exclude_ids]
+    after_excl = [a for a in raw if _is_asset_allowed(a) and a["id"] not in exclude_ids]
     assets = [a for a in after_excl if _shape_filter(a)]
     log.info("pick(%s): search returned %d, %d after exclusion, %d after shape", shape, len(raw), len(after_excl), len(assets))
     if not assets:
@@ -565,38 +563,38 @@ def _compose_canvas(sources: list[Image.Image], layout: str, assets: list[dict])
         canvas.paste(_fit_to_slot(sources[1], assets[1]["id"], slot_w, slot_h), (slot_w, 0))
 
         # Build layout elements for asset 0
-        lbl0 = _asset_names(assets[0])
-        yr0 = _get_year(assets[0])
-        if yr0:
-            lbl0.append(yr0)
+        labels_0 = _asset_names(assets[0])
+        year_0 = _get_year(assets[0])
+        if year_0:
+            labels_0.append(year_0)
 
         # Build layout elements for asset 1
-        lbl1 = _asset_names(assets[1])
-        yr1 = _get_year(assets[1])
-        if yr1:
-            lbl1.append(yr1)
+        labels_1 = _asset_names(assets[1])
+        year_1 = _get_year(assets[1])
+        if year_1:
+            labels_1.append(year_1)
 
-        _draw_name_label(canvas, lbl0, 0, 0, slot_w, slot_h)
-        _draw_name_label(canvas, lbl1, slot_w, 0, slot_w, slot_h)
+        _draw_name_label(canvas, labels_0, 0, 0, slot_w, slot_h)
+        _draw_name_label(canvas, labels_1, slot_w, 0, slot_w, slot_h)
     else:
         slot_w, slot_h = CANVAS_W, CANVAS_H // 2
         canvas.paste(_fit_to_slot(sources[0], assets[0]["id"], slot_w, slot_h), (0, 0))
         canvas.paste(_fit_to_slot(sources[1], assets[1]["id"], slot_w, slot_h), (0, slot_h))
 
         # Build layout elements for asset 0
-        lbl0 = _asset_names(assets[0])
-        yr0 = _get_year(assets[0])
-        if yr0:
-            lbl0.append(yr0)
+        labels_0 = _asset_names(assets[0])
+        year_0 = _get_year(assets[0])
+        if year_0:
+            labels_0.append(year_0)
 
         # Build layout elements for asset 1
-        lbl1 = _asset_names(assets[1])
-        yr1 = _get_year(assets[1])
-        if yr1:
-            lbl1.append(yr1)
+        labels_1 = _asset_names(assets[1])
+        year_1 = _get_year(assets[1])
+        if year_1:
+            labels_1.append(year_1)
 
-        _draw_name_label(canvas, lbl0, 0, 0, slot_w, slot_h)
-        _draw_name_label(canvas, lbl1, 0, slot_h, slot_w, slot_h)
+        _draw_name_label(canvas, labels_0, 0, 0, slot_w, slot_h)
+        _draw_name_label(canvas, labels_1, 0, slot_h, slot_w, slot_h)
 
     return canvas
 
@@ -613,12 +611,12 @@ def _rotate_final_canvas(canvas: Image.Image) -> Image.Image:
 # ---------------------------------------------------------------------------
 # Dynamic Quantization Packing Engine
 # ---------------------------------------------------------------------------
-def _pack_canvas_with_dither_mode(canvas: Image.Image, dither: bool) -> tuple[bytes, Image.Image]:
-    if dither:
-        quant = canvas.quantize(palette=_PAL_IMG, dither=Image.Dither.FLOYDSTEINBERG)
+def _quantize_and_pack_frame(canvas: Image.Image, enable_dither: bool) -> tuple[bytes, Image.Image]:
+    if enable_dither:
+        quant = canvas.quantize(palette=_QUANTIZATION_PALETTE, dither=Image.Dither.FLOYDSTEINBERG)
         preview_source = quant.convert("RGB")
     else:
-        quant = canvas.quantize(palette=_PAL_IMG, dither=Image.Dither.NONE)
+        quant = canvas.quantize(palette=_QUANTIZATION_PALETTE, dither=Image.Dither.NONE)
         preview_source = canvas
 
     idx = np.asarray(quant, dtype=np.uint8)
@@ -754,7 +752,7 @@ def _build_frame() -> tuple[str, str, Image.Image]:
     return "+".join(a["id"] for a in best_assets), layout, best_canvas
 
 
-def _no_store(headers: dict) -> dict:
+def _add_no_store_headers(headers: dict) -> dict:
     return {**headers, "Cache-Control": "no-store, max-age=0"}
 
 
@@ -768,7 +766,7 @@ def frame_bin():
     try:
         asset_id, _, canvas = _build_frame()
         # Default hardware fallback dither choice: true
-        packed, _ = _pack_canvas_with_dither_mode(canvas, dither=True)
+        packed, _ = _quantize_and_pack_frame(canvas, enable_dither=True)
     except Exception as e:
         log.exception("frame.bin failed: %s", e)
         return Response(f"frame generation failed: {e}\n", status=503, mimetype="text/plain")
@@ -776,7 +774,7 @@ def frame_bin():
     return Response(
         packed,
         mimetype="application/octet-stream",
-        headers=_no_store({"X-Immich-Asset-Id": asset_id, "Content-Length": str(FRAME_BYTES)}),
+        headers=_add_no_store_headers({"X-Immich-Asset-Id": asset_id, "Content-Length": str(FRAME_BYTES)}),
     )
 
 
@@ -786,14 +784,14 @@ def frame_png():
     try:
         asset_id, _, canvas = _build_frame()
         # PNG explicitly forces dither evaluation
-        _, preview_source = _pack_canvas_with_dither_mode(canvas, dither=True)
+        _, preview_source = _quantize_and_pack_frame(canvas, enable_dither=True)
         png_buf = io.BytesIO()
         preview_source.save(png_buf, format="PNG")
         png_data = png_buf.getvalue()
     except Exception as e:
         log.exception("frame.png failed: %s", e)
         return Response(f"frame generation failed: {e}\n", status=503, mimetype="text/plain")
-    return Response(png_data, mimetype="image/png", headers=_no_store({"X-Immich-Asset-Id": asset_id}))
+    return Response(png_data, mimetype="image/png", headers=_add_no_store_headers({"X-Immich-Asset-Id": asset_id}))
 
 
 @app.get("/frame.jpg")
@@ -802,14 +800,14 @@ def frame_jpg():
     try:
         asset_id, _, canvas = _build_frame()
         # JPG explicitly drops dithering rules
-        _, preview_source = _pack_canvas_with_dither_mode(canvas, dither=False)
+        _, preview_source = _quantize_and_pack_frame(canvas, enable_dither=False)
         jpg_buf = io.BytesIO()
         preview_source.save(jpg_buf, format="JPEG", quality=85, optimize=True)
         jpg_data = jpg_buf.getvalue()
     except Exception as e:
         log.exception("frame.jpg failed: %s", e)
         return Response(f"frame generation failed: {e}\n", status=503, mimetype="text/plain")
-    return Response(jpg_data, mimetype="image/jpeg", headers=_no_store({"X-Immich-Asset-Id": asset_id}))
+    return Response(jpg_data, mimetype="image/jpeg", headers=_add_no_store_headers({"X-Immich-Asset-Id": asset_id}))
 
 
 @app.get("/healthz")
