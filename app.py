@@ -15,11 +15,10 @@ from flask import Flask, Response, request
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 # ---------------------------------------------------------------------------
-# Panel definition (Authoritative epd7in3e / E6 values)
+# Global & Hardware Panel Constants
 # ---------------------------------------------------------------------------
 PANEL_W, PANEL_H = 800, 480  # The panel itself is always landscape-native
 FRAME_BYTES = PANEL_W * PANEL_H // 2  # 192000 bytes
-
 PALETTE_RGB = [
     (0, 0, 0),  # black
     (255, 255, 255),  # white
@@ -31,7 +30,7 @@ PALETTE_RGB = [
 CODE_LUT = np.array([0x0, 0x1, 0x2, 0x3, 0x5, 0x6], dtype=np.uint8)
 
 # ---------------------------------------------------------------------------
-# Configuration & Environment Setup
+# Environment & App Configuration
 # ---------------------------------------------------------------------------
 IMMICH_URL = os.environ.get("IMMICH_URL", "http://immich-server:2283").rstrip("/")
 IMMICH_PUBLIC_URL = os.environ.get("IMMICH_PUBLIC_URL", IMMICH_URL).rstrip("/")
@@ -99,6 +98,11 @@ LABEL_FONT = os.environ.get("IMMICH_LABEL_FONT", "DejaVuSans-Bold").strip()
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 DEFAULT_LOG_LEVEL = getattr(logging, LOG_LEVEL, logging.INFO)
 
+HEADERS = {"x-api-key": API_KEY, "Accept": "application/json"}
+
+# ---------------------------------------------------------------------------
+# Logging Infrastructure Setup
+# ---------------------------------------------------------------------------
 log = logging.getLogger("immich-epaper")
 log.setLevel(DEFAULT_LOG_LEVEL)
 log.propagate = False
@@ -111,9 +115,14 @@ logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 log.info("Quality scoring enabled (pyiqa NIMA, BRISQUE, sharpness)")
 
+# ---------------------------------------------------------------------------
+# Flask Initialization
+# ---------------------------------------------------------------------------
+app = Flask(__name__)
+
 
 # ---------------------------------------------------------------------------
-# Font Asset Loading
+# Internal Core Asset & Image State Cache Variables
 # ---------------------------------------------------------------------------
 def _load_font(size: int):
     candidates = [LABEL_FONT, "DejaVuSans"]
@@ -133,11 +142,23 @@ def _load_font(size: int):
 
 
 _LABEL_FONT = _load_font(LABEL_FONT_SIZE)
-HEADERS = {"x-api-key": API_KEY, "Accept": "application/json"}
+
+
+def _build_palette_image() -> Image.Image:
+    pal = Image.new("P", (1, 1))
+    flat = []
+    for rgb in PALETTE_RGB:
+        flat.extend(rgb)
+    flat.extend([0] * (768 - len(flat)))
+    pal.putpalette(flat)
+    return pal
+
+
+_QUANTIZATION_PALETTE = _build_palette_image()
 
 
 # ---------------------------------------------------------------------------
-# Helper Utility Functions
+# Environment & Core Helper Utilities
 # ---------------------------------------------------------------------------
 def _resolve_api_date(d: str, end_of_day: bool) -> str:
     s = d.strip().lower()
@@ -197,150 +218,13 @@ def _log_startup_config() -> None:
 
 _log_startup_config()
 
-app = Flask(__name__)
 
-
-def _build_palette_image() -> Image.Image:
-    pal = Image.new("P", (1, 1))
-    flat = []
-    for rgb in PALETTE_RGB:
-        flat.extend(rgb)
-    flat.extend([0] * (768 - len(flat)))
-    pal.putpalette(flat)
-    return pal
-
-
-_QUANTIZATION_PALETTE = _build_palette_image()
+def _add_no_store_headers(headers: dict) -> dict:
+    return {**headers, "Cache-Control": "no-store, max-age=0"}
 
 
 # ---------------------------------------------------------------------------
-# Image Geometry & Face-Aware Cropping Logic
-# ---------------------------------------------------------------------------
-def _center_fit(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
-    log.info("crop: center fit (%dx%d -> %dx%d)", img.width, img.height, target_w, target_h)
-    return ImageOps.fit(img, (target_w, target_h), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
-
-
-def _get_asset_faces(asset_id: str) -> list[dict]:
-    try:
-        r = requests.get(f"{IMMICH_URL}/api/assets/{asset_id}", headers=HEADERS, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        extracted_faces = []
-        # 1. Extract faces tied to assigned/named people
-        for person in data.get("people", []) or []:
-            # Immich nesting: each person object can contain a list of face objects
-            faces = person.get("faces", []) or []
-            extracted_faces.extend(faces)
-        # 2. Extract faces that are detected but unassigned
-        unassigned = data.get("unassignedFaces", []) or []
-        extracted_faces.extend(unassigned)
-        log.info("found %d face(s) for asset %s", len(extracted_faces), asset_id)
-        return extracted_faces
-    except Exception as e:
-        log.warning("Failed to fetch face details for asset %s: %s", asset_id, e)
-        return []
-
-
-def _smart_face_fit(img: Image.Image, asset_id: str, target_w: int, target_h: int) -> Image.Image:
-    faces = _get_asset_faces(asset_id)
-    if not faces:
-        log.info("crop: no faces returned for %s, falling back to center", asset_id)
-        return _center_fit(img, target_w, target_h)
-
-    img_w, img_h = img.size
-    x_coords: list[float] = []
-    y_coords: list[float] = []
-
-    for face in faces:
-        x1 = face.get("boundingBoxX1")
-        y1 = face.get("boundingBoxY1")
-        x2 = face.get("boundingBoxX2")
-        y2 = face.get("boundingBoxY2")
-        face_img_w = face.get("imageWidth")
-        face_img_h = face.get("imageHeight")
-
-        if x1 is None or y1 is None or x2 is None or y2 is None:
-            continue
-        if not face_img_w or not face_img_h:
-            continue
-
-        # Scale from face-model pixel space -> our fetched image's pixel space
-        scale_x = img_w / float(face_img_w)
-        scale_y = img_h / float(face_img_h)
-
-        x_coords.extend([float(x1) * scale_x, float(x2) * scale_x])
-        y_coords.extend([float(y1) * scale_y, float(y2) * scale_y])
-
-    if not x_coords or not y_coords:
-        log.info("crop: no coordinates found for %s, falling back to center", asset_id)
-        return _center_fit(img, target_w, target_h)
-
-    # 1. Find the strict boundaries of the face cluster
-    f_min_x, f_max_x = min(x_coords), max(x_coords)
-    f_min_y, f_max_y = min(y_coords), max(y_coords)
-
-    f_w = f_max_x - f_min_x
-    f_h = f_max_y - f_min_y
-    f_center_x = f_min_x + (f_w / 2)
-    f_center_y = f_min_y + (f_h / 2)
-
-    # 2. Define our target aspect ratio
-    target_aspect = target_w / target_h
-
-    # 3. Figure out the minimum crop box size needed to include faces + context
-    # We want the crop box to be at least 2.5x the size of the face cluster
-    # so we don't get tight, awkward passport-photo crops.
-    PADDING_MULTIPLIER = 2.5
-
-    desired_w = f_w * PADDING_MULTIPLIER
-    desired_h = f_h * PADDING_MULTIPLIER
-
-    # Adjust desired dimensions to lock into the target aspect ratio
-    if desired_w / target_aspect > desired_h:
-        desired_h = desired_w / target_aspect
-    else:
-        desired_w = desired_h * target_aspect
-
-    # 4. Cap the crop box size so it doesn't exceed the actual image size
-    # If our padded box is too big for the photo, we scale it down to maximize the image use.
-    scale = min(1.0, img_w / desired_w, img_h / desired_h)
-    crop_w = int(desired_w * scale)
-    crop_h = int(desired_h * scale)
-
-    # 5. If the image is vast and the faces are tiny, don't zoom in to a tiny
-    # pixelated box. Ensure the crop covers at least 60% of the original photo's short edge.
-    min_short_edge = min(img_w, img_h) * 0.60
-    if crop_w / target_aspect < min_short_edge or crop_h < min_short_edge:
-        # Re-calculate box based on our fallback minimum background coverage rule
-        if img_w / target_aspect > img_h:
-            crop_h = int(img_h)
-            crop_w = int(crop_h * target_aspect)
-        else:
-            crop_w = int(img_w)
-            crop_h = int(crop_w / target_aspect)
-
-    # 6. Center our calculated canvas frame over the face group center
-    left = int(f_center_x - (crop_w / 2))
-    top = int(f_center_y - (crop_h / 2))
-
-    # 7. Final Safety Guard: Shift the box if it's spilling out of bounds
-    left = max(0, min(left, img_w - crop_w))
-    top = max(0, min(top, img_h - crop_h))
-
-    log.info("crop: aesthetic face-aware crop frame picked (%d, %d, %d, %d) for asset %s", left, top, left + crop_w, top + crop_h, asset_id)
-
-    return img.crop((left, top, left + crop_w, top + crop_h)).resize((target_w, target_h), Image.Resampling.LANCZOS)
-
-
-def _fit_to_slot(img: Image.Image, asset_id: str, target_w: int, target_h: int) -> Image.Image:
-    if CROP_MODE == "smart":
-        return _smart_face_fit(img, asset_id, target_w, target_h)
-    return _center_fit(img, target_w, target_h)
-
-
-# ---------------------------------------------------------------------------
-# Immich Asset Validation & Processing
+# Immich API Client & Validation Handlers
 # ---------------------------------------------------------------------------
 def _is_asset_allowed(asset: dict) -> bool:
     if not EXCLUDE_PEOPLE:
@@ -487,6 +371,117 @@ def _normalize_source(img: Image.Image) -> Image.Image:
     return img.convert("RGB")
 
 
+# ---------------------------------------------------------------------------
+# Image Geometry & Face-Aware Cropping Logic
+# ---------------------------------------------------------------------------
+def _center_fit(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
+    log.info("crop: center fit (%dx%d -> %dx%d)", img.width, img.height, target_w, target_h)
+    return ImageOps.fit(img, (target_w, target_h), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+
+
+def _get_asset_faces(asset_id: str) -> list[dict]:
+    try:
+        r = requests.get(f"{IMMICH_URL}/api/assets/{asset_id}", headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        extracted_faces = []
+        for person in data.get("people", []) or []:
+            faces = person.get("faces", []) or []
+            extracted_faces.extend(faces)
+        unassigned = data.get("unassignedFaces", []) or []
+        extracted_faces.extend(unassigned)
+        log.info("found %d face(s) for asset %s", len(extracted_faces), asset_id)
+        return extracted_faces
+    except Exception as e:
+        log.warning("Failed to fetch face details for asset %s: %s", asset_id, e)
+        return []
+
+
+def _smart_face_fit(img: Image.Image, asset_id: str, target_w: int, target_h: int) -> Image.Image:
+    faces = _get_asset_faces(asset_id)
+    if not faces:
+        log.info("crop: no faces returned for %s, falling back to center", asset_id)
+        return _center_fit(img, target_w, target_h)
+
+    img_w, img_h = img.size
+    x_coords: list[float] = []
+    y_coords: list[float] = []
+
+    for face in faces:
+        x1 = face.get("boundingBoxX1")
+        y1 = face.get("boundingBoxY1")
+        x2 = face.get("boundingBoxX2")
+        y2 = face.get("boundingBoxY2")
+        face_img_w = face.get("imageWidth")
+        face_img_h = face.get("imageHeight")
+
+        if x1 is None or y1 is None or x2 is None or y2 is None:
+            continue
+        if not face_img_w or not face_img_h:
+            continue
+
+        scale_x = img_w / float(face_img_w)
+        scale_y = img_h / float(face_img_h)
+
+        x_coords.extend([float(x1) * scale_x, float(x2) * scale_x])
+        y_coords.extend([float(y1) * scale_y, float(y2) * scale_y])
+
+    if not x_coords or not y_coords:
+        log.info("crop: no coordinates found for %s, falling back to center", asset_id)
+        return _center_fit(img, target_w, target_h)
+
+    f_min_x, f_max_x = min(x_coords), max(x_coords)
+    f_min_y, f_max_y = min(y_coords), max(y_coords)
+
+    f_w = f_max_x - f_min_x
+    f_h = f_max_y - f_min_y
+    f_center_x = f_min_x + (f_w / 2)
+    f_center_y = f_min_y + (f_h / 2)
+
+    target_aspect = target_w / target_h
+    PADDING_MULTIPLIER = 2.5
+
+    desired_w = f_w * PADDING_MULTIPLIER
+    desired_h = f_h * PADDING_MULTIPLIER
+
+    if desired_w / target_aspect > desired_h:
+        desired_h = desired_w / target_aspect
+    else:
+        desired_w = desired_h * target_aspect
+
+    scale = min(1.0, img_w / desired_w, img_h / desired_h)
+    crop_w = int(desired_w * scale)
+    crop_h = int(desired_h * scale)
+
+    min_short_edge = min(img_w, img_h) * 0.60
+    if crop_w / target_aspect < min_short_edge or crop_h < min_short_edge:
+        if img_w / target_aspect > img_h:
+            crop_h = int(img_h)
+            crop_w = int(crop_h * target_aspect)
+        else:
+            crop_w = int(img_w)
+            crop_h = int(crop_w / target_aspect)
+
+    left = int(f_center_x - (crop_w / 2))
+    top = int(f_center_y - (crop_h / 2))
+
+    left = max(0, min(left, img_w - crop_w))
+    top = max(0, min(top, img_h - crop_h))
+
+    log.info("crop: aesthetic face-aware crop frame picked (%d, %d, %d, %d) for asset %s", left, top, left + crop_w, top + crop_h, asset_id)
+
+    return img.crop((left, top, left + crop_w, top + crop_h)).resize((target_w, target_h), Image.Resampling.LANCZOS)
+
+
+def _fit_to_slot(img: Image.Image, asset_id: str, target_w: int, target_h: int) -> Image.Image:
+    if CROP_MODE == "smart":
+        return _smart_face_fit(img, asset_id, target_w, target_h)
+    return _center_fit(img, target_w, target_h)
+
+
+# ---------------------------------------------------------------------------
+# Drawing, Text & Canvas UI Layout Compositions
+# ---------------------------------------------------------------------------
 def _pick_layout() -> str:
     if DUO_PROBABILITY <= 0.0 or ASSET_ORIENTATION != "any":
         return "single"
@@ -495,9 +490,11 @@ def _pick_layout() -> str:
     return "duo" if random.random() < DUO_PROBABILITY else "single"
 
 
-# ---------------------------------------------------------------------------
-# Drawing & UI Compositions
-# ---------------------------------------------------------------------------
+def _get_year(asset: dict) -> str:
+    dt_str = asset.get("fileCreatedAt") or asset.get("exifInfo", {}).get("dateTimeOriginal") or ""
+    return dt_str[:4] if len(dt_str) >= 4 and dt_str[:4].isdigit() else ""
+
+
 def _draw_name_label(canvas: Image.Image, names: list[str], slot_x: int, slot_y: int, slot_w: int, slot_h: int) -> None:
     if not names or not SHOW_NAMES:
         return
@@ -534,12 +531,6 @@ def _draw_name_label(canvas: Image.Image, names: list[str], slot_x: int, slot_y:
     draw.text((rect_x + LABEL_PADDING_X, rect_y + LABEL_PADDING_Y - 1), text, fill=(0, 0, 0), font=_LABEL_FONT)
 
 
-def _get_year(asset: dict) -> str:
-    # Fallback cascade to get the date string safely
-    dt_str = asset.get("fileCreatedAt") or asset.get("exifInfo", {}).get("dateTimeOriginal") or ""
-    return dt_str[:4] if len(dt_str) >= 4 and dt_str[:4].isdigit() else ""
-
-
 def _compose_canvas(sources: list[Image.Image], layout: str, assets: list[dict]) -> Image.Image:
     canvas = Image.new("RGB", (CANVAS_W, CANVAS_H), (255, 255, 255))
 
@@ -547,7 +538,6 @@ def _compose_canvas(sources: list[Image.Image], layout: str, assets: list[dict])
         assert len(sources) == 1 and len(assets) == 1
         canvas.paste(_fit_to_slot(sources[0], assets[0]["id"], CANVAS_W, CANVAS_H), (0, 0))
 
-        # Merge names and year
         label_elements = _asset_names(assets[0])
         year = _get_year(assets[0])
         if year:
@@ -562,13 +552,11 @@ def _compose_canvas(sources: list[Image.Image], layout: str, assets: list[dict])
         canvas.paste(_fit_to_slot(sources[0], assets[0]["id"], slot_w, slot_h), (0, 0))
         canvas.paste(_fit_to_slot(sources[1], assets[1]["id"], slot_w, slot_h), (slot_w, 0))
 
-        # Build layout elements for asset 0
         labels_0 = _asset_names(assets[0])
         year_0 = _get_year(assets[0])
         if year_0:
             labels_0.append(year_0)
 
-        # Build layout elements for asset 1
         labels_1 = _asset_names(assets[1])
         year_1 = _get_year(assets[1])
         if year_1:
@@ -581,13 +569,11 @@ def _compose_canvas(sources: list[Image.Image], layout: str, assets: list[dict])
         canvas.paste(_fit_to_slot(sources[0], assets[0]["id"], slot_w, slot_h), (0, 0))
         canvas.paste(_fit_to_slot(sources[1], assets[1]["id"], slot_w, slot_h), (0, slot_h))
 
-        # Build layout elements for asset 0
         labels_0 = _asset_names(assets[0])
         year_0 = _get_year(assets[0])
         if year_0:
             labels_0.append(year_0)
 
-        # Build layout elements for asset 1
         labels_1 = _asset_names(assets[1])
         year_1 = _get_year(assets[1])
         if year_1:
@@ -609,28 +595,7 @@ def _rotate_final_canvas(canvas: Image.Image) -> Image.Image:
 
 
 # ---------------------------------------------------------------------------
-# Dynamic Quantization Packing Engine
-# ---------------------------------------------------------------------------
-def _quantize_and_pack_frame(canvas: Image.Image, enable_dither: bool) -> tuple[bytes, Image.Image]:
-    if enable_dither:
-        quant = canvas.quantize(palette=_QUANTIZATION_PALETTE, dither=Image.Dither.FLOYDSTEINBERG)
-        preview_source = quant.convert("RGB")
-    else:
-        quant = canvas.quantize(palette=_QUANTIZATION_PALETTE, dither=Image.Dither.NONE)
-        preview_source = canvas
-
-    idx = np.asarray(quant, dtype=np.uint8)
-    codes = CODE_LUT[idx]
-    hi = codes[:, 0::2] << 4
-    lo = codes[:, 1::2]
-    packed = (hi | lo).astype(np.uint8).tobytes()
-    assert len(packed) == FRAME_BYTES, len(packed)
-
-    return packed, preview_source
-
-
-# ---------------------------------------------------------------------------
-# Quality Scoring Analytics (using pyiqa)
+# Pyiqa Image Quality Scoring Analytics
 # ---------------------------------------------------------------------------
 _nima_model = None
 _brisque_model = None
@@ -686,8 +651,26 @@ def _composite_score(img: Image.Image) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Core Layout Matrix Builder (Returns clean unquantized RGB canvas)
+# Quantization Packing & Frame Assembly Engines
 # ---------------------------------------------------------------------------
+def _quantize_and_pack_frame(canvas: Image.Image, enable_dither: bool) -> tuple[bytes, Image.Image]:
+    if enable_dither:
+        quant = canvas.quantize(palette=_QUANTIZATION_PALETTE, dither=Image.Dither.FLOYDSTEINBERG)
+        preview_source = quant.convert("RGB")
+    else:
+        quant = canvas.quantize(palette=_QUANTIZATION_PALETTE, dither=Image.Dither.NONE)
+        preview_source = canvas
+
+    idx = np.asarray(quant, dtype=np.uint8)
+    codes = CODE_LUT[idx]
+    hi = codes[:, 0::2] << 4
+    lo = codes[:, 1::2]
+    packed = (hi | lo).astype(np.uint8).tobytes()
+    assert len(packed) == FRAME_BYTES, len(packed)
+
+    return packed, preview_source
+
+
 def _build_frame() -> tuple[str, str, Image.Image]:
     layout = _pick_layout()
     log.info("build: layout=%s (device=%s, duo_prob=%.2f)", layout, DEVICE_ORIENTATION, DUO_PROBABILITY)
@@ -752,12 +735,8 @@ def _build_frame() -> tuple[str, str, Image.Image]:
     return "+".join(a["id"] for a in best_assets), layout, best_canvas
 
 
-def _add_no_store_headers(headers: dict) -> dict:
-    return {**headers, "Cache-Control": "no-store, max-age=0"}
-
-
 # ---------------------------------------------------------------------------
-# API Routing Endpoints (Now enforcing format-specific dithering)
+# Flask Routing Endpoints
 # ---------------------------------------------------------------------------
 @app.get("/frame.bin")
 def frame_bin():
@@ -765,7 +744,6 @@ def frame_bin():
     t0 = time.monotonic()
     try:
         asset_id, _, canvas = _build_frame()
-        # Default hardware fallback dither choice: true
         packed, _ = _quantize_and_pack_frame(canvas, enable_dither=True)
     except Exception as e:
         log.exception("frame.bin failed: %s", e)
@@ -783,7 +761,6 @@ def frame_png():
     log.info("request: GET /frame.png from %s", request.remote_addr)
     try:
         asset_id, _, canvas = _build_frame()
-        # PNG explicitly forces dither evaluation
         _, preview_source = _quantize_and_pack_frame(canvas, enable_dither=True)
         png_buf = io.BytesIO()
         preview_source.save(png_buf, format="PNG")
@@ -799,7 +776,6 @@ def frame_jpg():
     log.info("request: GET /frame.jpg from %s", request.remote_addr)
     try:
         asset_id, _, canvas = _build_frame()
-        # JPG explicitly drops dithering rules
         _, preview_source = _quantize_and_pack_frame(canvas, enable_dither=False)
         jpg_buf = io.BytesIO()
         preview_source.save(jpg_buf, format="JPEG", quality=85, optimize=True)
@@ -816,7 +792,7 @@ def healthz():
 
 
 # ---------------------------------------------------------------------------
-# Initialization Pre-loading
+# Application Server & Pre-warm Startup Process
 # ---------------------------------------------------------------------------
 def _warmup_quality_models() -> None:
     if not QUALITY_ENABLED:
