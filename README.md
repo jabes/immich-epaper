@@ -1,8 +1,6 @@
-![Immich e-Paper Server](logo.svg)
+![Immich e-Paper Server](logo.svg#gh-light-mode-only=200xauto)
 
----
 [![build-and-push](https://github.com/jabes/immich-epaper/actions/workflows/build-and-push.yml/badge.svg?branch=main)](https://github.com/jabes/immich-epaper/actions/workflows/build-and-push.yml)
----
 
 # Immich e-Paper Server
 
