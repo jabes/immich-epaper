@@ -1,8 +1,4 @@
 ![Immich e-Paper Server Logo](assets/logo.svg)
----
-![Example Landscape](assets/example_landscape.png)
-![Example Duo Portrait](assets/example_duo_portrait.png)
----
 [![build-and-push](https://github.com/jabes/immich-epaper/actions/workflows/build-and-push.yml/badge.svg?branch=main)](https://github.com/jabes/immich-epaper/actions/workflows/build-and-push.yml)
 
 # Immich e-Paper Server
@@ -80,3 +76,9 @@ pyenv activate immich-epaper
 pip install --upgrade wheel setuptools pip
 pip install --requirement requirements.txt
 ```
+
+
+## Examples
+
+![Example Landscape](assets/example_landscape.png)
+![Example Duo Portrait](assets/example_duo_portrait.png)
