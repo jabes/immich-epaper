@@ -4,7 +4,6 @@ An aesthetic, containerized Flask web server that interfaces with your self-host
 
 It features an analytical image quality ranking pipeline using `pyiqa` and custom OpenCV analytics, ensuring your digital e-ink frame always selects the highest-quality, best-composed imagery from your library.
 
----
 
 ## Features
 
@@ -14,7 +13,6 @@ It features an analytical image quality ranking pipeline using `pyiqa` and custo
 * **e-Paper Packing Engine:** Provides raw multi-chromatic color quantization (`/frame.bin`) utilizing custom color LUT mapping and high-quality Floyd-Steinberg dithering tailored for physical panels.
 * **Debugging Previews:** Delivers standard browser-readable endpoints (`/frame.png` and `/frame.jpg`) showing real-time text labels, dates, and dither status for effortless alignment checking.
 
----
 
 ## Environment Variables
 
@@ -39,7 +37,6 @@ It features an analytical image quality ranking pipeline using `pyiqa` and custo
 | `FRAME_ROTATE` | `0` | Final hardware correction angle applied to canvas. Accepts: `90`, `180`, `270`. |
 | `LOG_LEVEL` | `INFO` | Adjust application output reporting verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`). |
 
----
 
 ## API Endpoints
 
@@ -61,7 +58,6 @@ Serves a smooth, non-dithered JPEG rendition of the composed layout with 85% com
 
 Simple monitoring endpoint returning service state and active album context.
 
----
 
 ## Local Development
 
