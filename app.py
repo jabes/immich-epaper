@@ -335,35 +335,33 @@ def _pick_asset(shape: str, exclude_ids: set[str] | None = None) -> dict:
     # 2. Search Mode (with automatic fallback tiering)
     body = _build_search_payload()
 
-    for pass_num in ("strict", "fallback"):
-        if pass_num == "fallback":
-            log.warning("pick(%s): Strict filters returned 0 assets. Dropping constraints for a wide safety sweep.", shape)
-            body = {"type": "IMAGE", "size": 50, "withArchived": False, "withPeople": True, "withExif": True}
+    log.info("pick(%s): executing search...", shape)
+    r = requests.post(f"{IMMICH_URL}/api/search/random", headers={**HEADERS, "Content-Type": "application/json"}, json=body, timeout=30)
+    r.raise_for_status()
 
-        log.info("pick(%s): executing search (mode=%s)", shape, pass_num)
-        r = requests.post(f"{IMMICH_URL}/api/search/random", headers={**HEADERS, "Content-Type": "application/json"}, json=body, timeout=30)
-        r.raise_for_status()
+    data = r.json()
+    raw = data if isinstance(data, list) else data.get("assets", {}).get("items", [])
+    raw = [a for a in raw if a.get("type") == "IMAGE"]
 
-        data = r.json()
-        raw = data if isinstance(data, list) else data.get("assets", {}).get("items", [])
-        raw = [a for a in raw if a.get("type") == "IMAGE"]
-
-        if raw:
-            break
-    else:
-        raise RuntimeError("Immich instance returned zero total image assets during fallback search sweep.")
+    if not raw:
+        raise RuntimeError("search returned empty or malformed response.")
 
     # 3. Apply Filters & Layout Shape Recovery
     after_excl = [a for a in raw if _is_asset_allowed(a) and a["id"] not in exclude_ids]
     assets = [a for a in after_excl if _shape_filter(a)]
 
-    log.info("pick(%s): search returned %d, %d after exclusion, %d after shape.", shape, len(raw), len(after_excl), len(assets))
+    log.info(
+        "pick(%s): search returned %d, %d after exclusion, %d after shape.",
+        shape,
+        len(raw),
+        len(after_excl),
+        len(assets),
+    )
 
     if not assets:
-        log.warning("pick(%s): No assets matched shape constraint. Disregarding shape rules to preserve layout cycle.", shape)
-        chosen = random.choice(after_excl) if after_excl else random.choice(raw)
-    else:
-        chosen = random.choice(assets)
+        raise RuntimeError(f"search returned no matching {shape} assets after exclusion/shape filtering.")
+
+    chosen = random.choice(assets)
 
     log.info(
         "pick(%s): chose %s (%s) %s names=%s  %s/photos/%s",
@@ -375,6 +373,7 @@ def _pick_asset(shape: str, exclude_ids: set[str] | None = None) -> dict:
         IMMICH_PUBLIC_URL,
         chosen["id"],
     )
+
     return chosen
 
 
@@ -474,14 +473,16 @@ def _smart_face_fit(img: Image.Image, asset_id: str, target_w: int, target_h: in
     crop_w = int(desired_w * scale)
     crop_h = int(desired_h * scale)
 
-    min_short_edge = min(img_w, img_h) * 0.60
-    if crop_w / target_aspect < min_short_edge or crop_h < min_short_edge:
-        if img_w / target_aspect > img_h:
-            crop_h = int(img_h)
-            crop_w = int(crop_h * target_aspect)
-        else:
-            crop_w = int(img_w)
-            crop_h = int(crop_w / target_aspect)
+    # Never let the crop shrink below the face bounding box itself
+    crop_w = max(crop_w, int(f_w))
+    crop_h = max(crop_h, int(f_h))
+    if crop_w / target_aspect > crop_h:
+        crop_h = int(crop_w / target_aspect)
+    else:
+        crop_w = int(crop_h * target_aspect)
+
+    crop_w = min(crop_w, img_w)
+    crop_h = min(crop_h, img_h)
 
     left = int(f_center_x - (crop_w / 2))
     top = int(f_center_y - (crop_h / 2))
@@ -527,7 +528,9 @@ def _draw_name_label(canvas: Image.Image, names: list[str], slot_x: int, slot_y:
         ell = "…"
         while text and draw.textlength(text + ell, font=_LABEL_FONT) > max_text_w:
             text = text[:-1]
-        text = text.rstrip(LABEL_DELIMITER) + ell
+        if text.endswith(LABEL_DELIMITER):
+            text = text[: -len(LABEL_DELIMITER)]
+        text = text + ell
 
     tw = draw.textlength(text, font=_LABEL_FONT)
     metrics = getattr(_LABEL_FONT, "getmetrics", lambda: (12, 2))()
@@ -733,8 +736,8 @@ def _build_frame() -> tuple[str, str, Image.Image]:
             sources = [_fetch_image(a["id"]) for a in assets]
             canvas = _compose_canvas([_normalize_source(s) for s in sources], layout, assets)
             canvas = _rotate_final_canvas(canvas)
-
             score = _composite_score(canvas)
+
             log.info("candidate %d: score=%.4f (assets: %s)", i + 1, score, [a["id"] for a in assets])
             candidates.append((score, assets, canvas))
         except Exception as e:
