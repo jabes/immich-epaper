@@ -1,4 +1,4 @@
-<img src="logo.svg" width="200" height="auto" align="center" />
+<img src="logo.svg" width="600" height="auto" align="center" />
 
 [![build-and-push](https://github.com/jabes/immich-epaper/actions/workflows/build-and-push.yml/badge.svg?branch=main)](https://github.com/jabes/immich-epaper/actions/workflows/build-and-push.yml)
 
