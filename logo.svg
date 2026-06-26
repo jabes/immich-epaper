@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <filter id="epaper-shadow" x="-10%" y="-10%" width="130%" height="130%">
+      <feDropShadow dx="8" dy="8" stdDeviation="0" flood-color="#000000" flood-opacity="1"/>
+    </filter>
+  </defs>
+  <rect x="32" y="64" width="448" height="384" rx="24" fill="#000000" />
+  <rect x="36" y="68" width="440" height="376" rx="20" fill="#FFFFFF" stroke="#000000" stroke-width="4" />
+  <g filter="url(#epaper-shadow)">
+    <rect x="56" y="88" width="400" height="336" rx="6" fill="#FFFFFF" stroke="#000000" stroke-width="6" />
+    <rect x="56" y="88" width="197" height="336" fill="#BF2323" stroke="#000000" stroke-width="3" />
+    <path d="M56,424 L120,320 L180,380 L220,300 L253,424 Z" fill="#FFF338" stroke="#000000" stroke-width="4" stroke-linejoin="round" />
+    <rect x="259" y="88" width="197" height="336" fill="#2D41AA" stroke="#000000" stroke-width="3" />
+    <circle cx="256" cy="256" r="64" fill="#FFFFFF" stroke="#000000" stroke-width="8" />
+    <circle cx="256" cy="256" r="48" fill="#23824B" stroke="#000000" stroke-width="4" />
+    <circle cx="244" cy="244" r="12" fill="#FFFFFF" />
+    <path d="M420,108 H440 M440,108 V128" stroke="#FFFFFF" stroke-width="4" stroke-linecap="round" />
+    <rect x="280" y="380" width="150" height="30" rx="4" fill="#FFFFFF" stroke="#000000" stroke-width="3" />
+    <line x1="292" y1="395" x2="360" y2="395" stroke="#000000" stroke-width="4" stroke-linecap="round" />
+    <circle cx="410" cy="395" r="4" fill="#23824B" />
+  </g>
+</svg>

@@ -1,3 +1,6 @@
+![Immich e-Paper Server](logo.svg)
+
+
 # Immich e-Paper Server
 
 An aesthetic, containerized Flask web server that interfaces with your self-hosted **Immich** instance to serve dynamic photo frames or multi-photo layouts optimized specifically for e-Paper electronic ink displays (such as 7-color palettes, custom rotations, and specific byte packing layouts).
