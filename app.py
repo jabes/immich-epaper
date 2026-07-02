@@ -5,14 +5,17 @@ import random
 import re
 import sys
 import time
-from datetime import datetime, timedelta, timezone
-
+import gc
+import ctypes
 import cv2
 import numpy as np
 import pyiqa
 import requests
+import torch
 from flask import Flask, Response, request
 from PIL import Image, ImageDraw, ImageFont, ImageOps
+from typing import Any
+from datetime import datetime, timedelta, timezone
 
 # ---------------------------------------------------------------------------
 # Global & Hardware Panel Constants
@@ -283,7 +286,7 @@ def _asset_names(asset: dict) -> list[str]:
 
 
 def _build_search_payload() -> dict:
-    body = {
+    body: dict[str, Any] = {
         "type": "IMAGE",
         "size": max(1, min(SEARCH_BATCH, 1000)),
         "withArchived": False,
@@ -436,6 +439,8 @@ def _smart_face_fit(img: Image.Image, asset_id: str, target_w: int, target_h: in
         face_img_h = face.get("imageHeight")
 
         if x1 is None or y1 is None or x2 is None or y2 is None:
+            continue
+        if face_img_w is None or face_img_h is None:
             continue
         if not face_img_w or not face_img_h:
             continue
@@ -619,7 +624,7 @@ def _rotate_final_canvas(canvas: Image.Image) -> Image.Image:
 
 
 # ---------------------------------------------------------------------------
-# Pyiqa Image Quality Scoring Analytics
+# PyTorch Image Quality Scoring Analytics
 # ---------------------------------------------------------------------------
 _nima_model = None
 _brisque_model = None
@@ -760,64 +765,13 @@ def _build_frame() -> tuple[str, str, Image.Image]:
 
 
 # ---------------------------------------------------------------------------
-# Flask Routing Endpoints
-# ---------------------------------------------------------------------------
-@app.get("/frame.bin")
-def frame_bin():
-    log.info("request: GET /frame.bin from %s", request.remote_addr)
-    t0 = time.monotonic()
-    try:
-        asset_id, _, canvas = _build_frame()
-        packed, _ = _quantize_and_pack_frame(canvas, enable_dither=True)
-    except Exception as e:
-        log.exception("frame.bin failed: %s", e)
-        return Response(f"frame generation failed: {e}\n", status=503, mimetype="text/plain")
-    log.info("request: served /frame.bin asset %s in %.0f ms", asset_id, (time.monotonic() - t0) * 1000)
-    return Response(
-        packed,
-        mimetype="application/octet-stream",
-        headers=_add_no_store_headers({"X-Immich-Asset-Id": asset_id, "Content-Length": str(FRAME_BYTES)}),
-    )
-
-
-@app.get("/frame.png")
-def frame_png():
-    log.info("request: GET /frame.png from %s", request.remote_addr)
-    try:
-        asset_id, _, canvas = _build_frame()
-        _, preview_source = _quantize_and_pack_frame(canvas, enable_dither=True)
-        png_buf = io.BytesIO()
-        preview_source.save(png_buf, format="PNG")
-        png_data = png_buf.getvalue()
-    except Exception as e:
-        log.exception("frame.png failed: %s", e)
-        return Response(f"frame generation failed: {e}\n", status=503, mimetype="text/plain")
-    return Response(png_data, mimetype="image/png", headers=_add_no_store_headers({"X-Immich-Asset-Id": asset_id}))
-
-
-@app.get("/frame.jpg")
-def frame_jpg():
-    log.info("request: GET /frame.jpg from %s", request.remote_addr)
-    try:
-        asset_id, _, canvas = _build_frame()
-        _, preview_source = _quantize_and_pack_frame(canvas, enable_dither=False)
-        jpg_buf = io.BytesIO()
-        preview_source.save(jpg_buf, format="JPEG", quality=85, optimize=True)
-        jpg_data = jpg_buf.getvalue()
-    except Exception as e:
-        log.exception("frame.jpg failed: %s", e)
-        return Response(f"frame generation failed: {e}\n", status=503, mimetype="text/plain")
-    return Response(jpg_data, mimetype="image/jpeg", headers=_add_no_store_headers({"X-Immich-Asset-Id": asset_id}))
-
-
-@app.get("/healthz")
-def healthz():
-    return {"ok": True, "album_mode": bool(ALBUM_ID)}
-
-
-# ---------------------------------------------------------------------------
 # Application Server & Pre-warm Startup Process
 # ---------------------------------------------------------------------------
+try:
+    _libc = ctypes.CDLL("libc.so.6")
+except OSError:
+    _libc = None
+
 def _warmup_quality_models() -> None:
     if not QUALITY_ENABLED:
         return
@@ -831,8 +785,78 @@ def _warmup_quality_models() -> None:
     except Exception as e:
         log.warning("warmup: pyiqa preload failed (%s); models will load lazily", e)
 
+def _unload_quality_models() -> None:
+    global _nima_model, _brisque_model
+    if _nima_model is None and _brisque_model is None:
+        return
+    t0 = time.monotonic()
+    _nima_model = None
+    _brisque_model = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if _libc is not None:
+        _libc.malloc_trim(0)
+    log.info("unload: freed quality models in %.0f ms", (time.monotonic() - t0) * 1000)
 
-_warmup_quality_models()
+
+# ---------------------------------------------------------------------------
+# Flask Routing Endpoints
+# ---------------------------------------------------------------------------
+@app.get("/frame.bin")
+def frame_bin():
+    log.info("request: GET /frame.bin from %s", request.remote_addr)
+    t0 = time.monotonic()
+    try:
+        asset_id, _, canvas = _build_frame()
+        packed, _ = _quantize_and_pack_frame(canvas, enable_dither=True)
+    except Exception as e:
+        log.exception("frame.bin failed: %s", e)
+        return Response(f"frame generation failed: {e}\n", status=503, mimetype="text/plain")
+    finally:
+        _unload_quality_models()
+    log.info("request: served /frame.bin asset %s in %.0f ms", asset_id, (time.monotonic() - t0) * 1000)
+    return Response(
+        packed,
+        mimetype="application/octet-stream",
+        headers=_add_no_store_headers({"X-Immich-Asset-Id": asset_id, "Content-Length": str(FRAME_BYTES)}),
+    )
+
+@app.get("/frame.png")
+def frame_png():
+    log.info("request: GET /frame.png from %s", request.remote_addr)
+    try:
+        asset_id, _, canvas = _build_frame()
+        _, preview_source = _quantize_and_pack_frame(canvas, enable_dither=True)
+        png_buf = io.BytesIO()
+        preview_source.save(png_buf, format="PNG")
+        png_data = png_buf.getvalue()
+    except Exception as e:
+        log.exception("frame.png failed: %s", e)
+        return Response(f"frame generation failed: {e}\n", status=503, mimetype="text/plain")
+    finally:
+        _unload_quality_models()
+    return Response(png_data, mimetype="image/png", headers=_add_no_store_headers({"X-Immich-Asset-Id": asset_id}))
+
+@app.get("/frame.jpg")
+def frame_jpg():
+    log.info("request: GET /frame.jpg from %s", request.remote_addr)
+    try:
+        asset_id, _, canvas = _build_frame()
+        _, preview_source = _quantize_and_pack_frame(canvas, enable_dither=False)
+        jpg_buf = io.BytesIO()
+        preview_source.save(jpg_buf, format="JPEG", quality=85, optimize=True)
+        jpg_data = jpg_buf.getvalue()
+    except Exception as e:
+        log.exception("frame.jpg failed: %s", e)
+        return Response(f"frame generation failed: {e}\n", status=503, mimetype="text/plain")
+    finally:
+        _unload_quality_models()
+    return Response(jpg_data, mimetype="image/jpeg", headers=_add_no_store_headers({"X-Immich-Asset-Id": asset_id}))
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "album_mode": bool(ALBUM_ID)}
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
