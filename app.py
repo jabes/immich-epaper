@@ -4,6 +4,7 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 import gc
 import ctypes
@@ -84,6 +85,8 @@ if CROP_MODE not in {"center", "smart"}:
 RANKING_BATCH = int(os.environ.get("IMMICH_RANKING_BATCH", "5"))
 QUALITY_ENABLED = os.environ.get("IMMICH_QUALITY_ENABLED", "true").lower() != "false"
 
+CACHE_ENABLED = os.environ.get("IMMICH_CACHE_ENABLED", "false").lower() == "true"
+
 SHOW_NAMES = os.environ.get("IMMICH_SHOW_NAMES", "true").lower() != "false"
 LABEL_FONT_SIZE = int(os.environ.get("IMMICH_LABEL_FONT_SIZE", "12"))
 LABEL_PADDING_X = int(os.environ.get("IMMICH_LABEL_PADDING_X", "8"))
@@ -161,6 +164,19 @@ _QUANTIZATION_PALETTE = _build_palette_image()
 
 
 # ---------------------------------------------------------------------------
+# Frame Cache State
+# ---------------------------------------------------------------------------
+_cache_lock = threading.Lock()
+_cache: dict[str, Any] = {
+    "asset_id": None,
+    "bin": None,
+    "png": None,
+    "jpg": None,
+    "generated_at": None,
+}
+
+
+# ---------------------------------------------------------------------------
 # Environment & Core Helper Utilities
 # ---------------------------------------------------------------------------
 def _resolve_api_date(d: str, end_of_day: bool) -> str:
@@ -209,6 +225,7 @@ def _log_startup_config() -> None:
         ("LOG_LEVEL", LOG_LEVEL),
         ("IMMICH_RANKING_BATCH", RANKING_BATCH),
         ("IMMICH_QUALITY_ENABLED", QUALITY_ENABLED),
+        ("IMMICH_CACHE_ENABLED", CACHE_ENABLED),
     ]
     log.info("starting immich-epaper, resolved config:")
     for k, v in items:
@@ -770,6 +787,49 @@ def _build_frame() -> tuple[str, str, Image.Image]:
     canvas = _rotate_final_canvas(_compose_canvas(sources, layout, assets))
     return "+".join(a["id"] for a in assets), layout, canvas
 
+
+# ---------------------------------------------------------------------------
+# Cache Generation & Access
+# ---------------------------------------------------------------------------
+def _generate_frame_all_formats() -> dict:
+    asset_id, _, canvas = _build_frame()
+    packed, preview_dithered = _quantize_and_pack_frame(canvas, enable_dither=True)
+    _, preview_no_dither = _quantize_and_pack_frame(canvas, enable_dither=False)
+
+    png_buf = io.BytesIO()
+    preview_dithered.save(png_buf, format="PNG")
+
+    jpg_buf = io.BytesIO()
+    preview_no_dither.save(jpg_buf, format="JPEG", quality=85, optimize=True)
+
+    return {
+        "asset_id": asset_id,
+        "bin": packed,
+        "png": png_buf.getvalue(),
+        "jpg": jpg_buf.getvalue(),
+        "generated_at": datetime.now(timezone.utc),
+    }
+
+
+def _refresh_cache() -> dict:
+    result = _generate_frame_all_formats()
+    with _cache_lock:
+        _cache.update(result)
+    log.info("cache: refreshed asset=%s at %s", result["asset_id"], result["generated_at"].isoformat())
+    return result
+
+
+def _get_cached(fmt: str) -> tuple[str, bytes]:
+    with _cache_lock:
+        asset_id = _cache["asset_id"]
+        data = _cache[fmt]
+    if asset_id is not None and data is not None:
+        return asset_id, data
+    log.info("cache: empty, generating on-demand (fmt=%s)", fmt)
+    result = _refresh_cache()
+    return result["asset_id"], result[fmt]
+
+
 # ---------------------------------------------------------------------------
 # Application Server & Pre-warm Startup Process
 # ---------------------------------------------------------------------------
@@ -811,11 +871,14 @@ def _unload_quality_models() -> None:
 # ---------------------------------------------------------------------------
 @app.get("/frame.bin")
 def frame_bin():
-    log.info("request: GET /frame.bin from %s", request.remote_addr)
+    log.info("request: GET /frame.bin from %s (cache=%s)", request.remote_addr, CACHE_ENABLED)
     t0 = time.monotonic()
     try:
-        asset_id, _, canvas = _build_frame()
-        packed, _ = _quantize_and_pack_frame(canvas, enable_dither=True)
+        if CACHE_ENABLED:
+            asset_id, packed = _get_cached("bin")
+        else:
+            asset_id, _, canvas = _build_frame()
+            packed, _ = _quantize_and_pack_frame(canvas, enable_dither=True)
     except Exception as e:
         log.exception("frame.bin failed: %s", e)
         return Response(f"frame generation failed: {e}\n", status=503, mimetype="text/plain")
@@ -830,13 +893,16 @@ def frame_bin():
 
 @app.get("/frame.png")
 def frame_png():
-    log.info("request: GET /frame.png from %s", request.remote_addr)
+    log.info("request: GET /frame.png from %s (cache=%s)", request.remote_addr, CACHE_ENABLED)
     try:
-        asset_id, _, canvas = _build_frame()
-        _, preview_source = _quantize_and_pack_frame(canvas, enable_dither=True)
-        png_buf = io.BytesIO()
-        preview_source.save(png_buf, format="PNG")
-        png_data = png_buf.getvalue()
+        if CACHE_ENABLED:
+            asset_id, png_data = _get_cached("png")
+        else:
+            asset_id, _, canvas = _build_frame()
+            _, preview_source = _quantize_and_pack_frame(canvas, enable_dither=True)
+            png_buf = io.BytesIO()
+            preview_source.save(png_buf, format="PNG")
+            png_data = png_buf.getvalue()
     except Exception as e:
         log.exception("frame.png failed: %s", e)
         return Response(f"frame generation failed: {e}\n", status=503, mimetype="text/plain")
@@ -846,13 +912,16 @@ def frame_png():
 
 @app.get("/frame.jpg")
 def frame_jpg():
-    log.info("request: GET /frame.jpg from %s", request.remote_addr)
+    log.info("request: GET /frame.jpg from %s (cache=%s)", request.remote_addr, CACHE_ENABLED)
     try:
-        asset_id, _, canvas = _build_frame()
-        _, preview_source = _quantize_and_pack_frame(canvas, enable_dither=False)
-        jpg_buf = io.BytesIO()
-        preview_source.save(jpg_buf, format="JPEG", quality=85, optimize=True)
-        jpg_data = jpg_buf.getvalue()
+        if CACHE_ENABLED:
+            asset_id, jpg_data = _get_cached("jpg")
+        else:
+            asset_id, _, canvas = _build_frame()
+            _, preview_source = _quantize_and_pack_frame(canvas, enable_dither=False)
+            jpg_buf = io.BytesIO()
+            preview_source.save(jpg_buf, format="JPEG", quality=85, optimize=True)
+            jpg_data = jpg_buf.getvalue()
     except Exception as e:
         log.exception("frame.jpg failed: %s", e)
         return Response(f"frame generation failed: {e}\n", status=503, mimetype="text/plain")
@@ -860,9 +929,36 @@ def frame_jpg():
         _unload_quality_models()
     return Response(jpg_data, mimetype="image/jpeg", headers=_add_no_store_headers({"X-Immich-Asset-Id": asset_id}))
 
+@app.post("/refresh")
+def refresh():
+    log.info("request: POST /refresh from %s", request.remote_addr)
+    t0 = time.monotonic()
+    try:
+        result = _refresh_cache()
+    except Exception as e:
+        log.exception("refresh failed: %s", e)
+        return Response(f"refresh failed: {e}\n", status=503, mimetype="text/plain")
+    finally:
+        _unload_quality_models()
+    return {
+        "ok": True,
+        "asset_id": result["asset_id"],
+        "generated_at": result["generated_at"].isoformat(),
+        "took_ms": int((time.monotonic() - t0) * 1000),
+    }
+
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "album_mode": bool(ALBUM_ID)}
+    with _cache_lock:
+        cached_asset = _cache["asset_id"]
+        generated_at = _cache["generated_at"]
+    return {
+        "ok": True,
+        "album_mode": bool(ALBUM_ID),
+        "cache_enabled": CACHE_ENABLED,
+        "cached_asset_id": cached_asset,
+        "cache_generated_at": generated_at.isoformat() if generated_at else None,
+    }
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
