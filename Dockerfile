@@ -38,6 +38,7 @@ COPY app.py .
 
 ENV PATH="/venv/bin:$PATH"
 ENV PYTHONUNBUFFERED=1
+ENV MALLOC_TRIM_THRESHOLD_=0
 
 # Preload models
 # RUN python -c "import pyiqa; pyiqa.create_metric('nima');"

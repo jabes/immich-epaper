@@ -101,6 +101,13 @@ FIRST_NAME_ONLY = os.environ.get("IMMICH_FIRST_NAME_ONLY", "true").lower() != "f
 LABEL_DELIMITER = os.environ.get("IMMICH_LABEL_DELIMITER", " - ")
 LABEL_FONT = os.environ.get("IMMICH_LABEL_FONT", "DejaVuSans-Bold").strip()
 
+try:
+    MIN_CROP_RETENTION = float(os.environ.get("IMMICH_MIN_CROP_RETENTION", "0.5"))
+except ValueError:
+    raise SystemExit("IMMICH_MIN_CROP_RETENTION must be a float between 0 and 1")
+if not 0.0 <= MIN_CROP_RETENTION <= 1.0:
+    raise SystemExit(f"IMMICH_MIN_CROP_RETENTION={MIN_CROP_RETENTION} must be between 0 and 1")
+
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 DEFAULT_LOG_LEVEL = getattr(logging, LOG_LEVEL, logging.INFO)
 
@@ -226,6 +233,7 @@ def _log_startup_config() -> None:
         ("IMMICH_RANKING_BATCH", RANKING_BATCH),
         ("IMMICH_QUALITY_ENABLED", QUALITY_ENABLED),
         ("IMMICH_CACHE_ENABLED", CACHE_ENABLED),
+        ("IMMICH_MIN_CROP_RETENTION", MIN_CROP_RETENTION),
     ]
     log.info("starting immich-epaper, resolved config:")
     for k, v in items:
@@ -437,11 +445,18 @@ def _get_asset_faces(asset_id: str) -> list[dict]:
         return []
 
 
-def _smart_face_fit(img: Image.Image, asset_id: str, target_w: int, target_h: int) -> Image.Image:
+def _center_crop_retention(src_w: int, src_h: int, target_w: int, target_h: int) -> float:
+    src_ar = src_w / src_h
+    tgt_ar = target_w / target_h
+    return min(src_ar, tgt_ar) / max(src_ar, tgt_ar)
+
+
+def _smart_face_fit(img: Image.Image, asset_id: str, target_w: int, target_h: int) -> tuple[Image.Image, float]:
     faces = _get_asset_faces(asset_id)
     if not faces:
         log.info("crop: no faces returned for %s, falling back to center", asset_id)
-        return _center_fit(img, target_w, target_h)
+        return _center_fit(img, target_w, target_h), \
+               _center_crop_retention(img.width, img.height, target_w, target_h)
 
     img_w, img_h = img.size
     x_coords: list[float] = []
@@ -457,8 +472,6 @@ def _smart_face_fit(img: Image.Image, asset_id: str, target_w: int, target_h: in
 
         if x1 is None or y1 is None or x2 is None or y2 is None:
             continue
-        if face_img_w is None or face_img_h is None:
-            continue
         if not face_img_w or not face_img_h:
             continue
 
@@ -470,7 +483,8 @@ def _smart_face_fit(img: Image.Image, asset_id: str, target_w: int, target_h: in
 
     if not x_coords or not y_coords:
         log.info("crop: no coordinates found for %s, falling back to center", asset_id)
-        return _center_fit(img, target_w, target_h)
+        return _center_fit(img, target_w, target_h), \
+               _center_crop_retention(img_w, img_h, target_w, target_h)
 
     f_min_x, f_max_x = min(x_coords), max(x_coords)
     f_min_y, f_max_y = min(y_coords), max(y_coords)
@@ -481,10 +495,10 @@ def _smart_face_fit(img: Image.Image, asset_id: str, target_w: int, target_h: in
     f_center_y = f_min_y + (f_h / 2)
 
     target_aspect = target_w / target_h
-    PADDING_MULTIPLIER = 2.5
+    padding_multiplier = 2.5
 
-    desired_w = f_w * PADDING_MULTIPLIER
-    desired_h = f_h * PADDING_MULTIPLIER
+    desired_w = f_w * padding_multiplier
+    desired_h = f_h * padding_multiplier
 
     if desired_w / target_aspect > desired_h:
         desired_h = desired_w / target_aspect
@@ -495,7 +509,6 @@ def _smart_face_fit(img: Image.Image, asset_id: str, target_w: int, target_h: in
     crop_w = int(desired_w * scale)
     crop_h = int(desired_h * scale)
 
-    # Never let the crop shrink below the face bounding box itself
     crop_w = max(crop_w, int(f_w))
     crop_h = max(crop_h, int(f_h))
     if crop_w / target_aspect > crop_h:
@@ -508,19 +521,26 @@ def _smart_face_fit(img: Image.Image, asset_id: str, target_w: int, target_h: in
 
     left = int(f_center_x - (crop_w / 2))
     top = int(f_center_y - (crop_h / 2))
-
     left = max(0, min(left, img_w - crop_w))
     top = max(0, min(top, img_h - crop_h))
 
-    log.info("crop: aesthetic face-aware crop frame picked (%d, %d, %d, %d) for asset %s", left, top, left + crop_w, top + crop_h, asset_id)
+    retention = (crop_w * crop_h) / (img_w * img_h)
+    log.info(
+        "crop: face-aware frame (%d, %d, %d, %d) retention=%.1f%% asset=%s",
+        left, top, left + crop_w, top + crop_h, retention * 100, asset_id,
+    )
 
-    return img.crop((left, top, left + crop_w, top + crop_h)).resize((target_w, target_h), Image.Resampling.LANCZOS)
+    fitted = img.crop((left, top, left + crop_w, top + crop_h)).resize(
+        (target_w, target_h), Image.Resampling.LANCZOS
+    )
+
+    return fitted, retention
 
 
-def _fit_to_slot(img: Image.Image, asset_id: str, target_w: int, target_h: int) -> Image.Image:
+def _fit_to_slot(img: Image.Image, asset_id: str, target_w: int, target_h: int) -> tuple[Image.Image, float]:
     if CROP_MODE == "smart":
         return _smart_face_fit(img, asset_id, target_w, target_h)
-    return _center_fit(img, target_w, target_h)
+    return _center_fit(img, target_w, target_h), _center_crop_retention(img.width, img.height, target_w, target_h)
 
 
 # ---------------------------------------------------------------------------
@@ -577,58 +597,50 @@ def _draw_name_label(canvas: Image.Image, names: list[str], slot_x: int, slot_y:
     draw.text((rect_x + LABEL_PADDING_X, rect_y + LABEL_PADDING_Y - 1), text, fill=(0, 0, 0), font=_LABEL_FONT)
 
 
-def _compose_canvas(sources: list[Image.Image], layout: str, assets: list[dict]) -> Image.Image:
+def _slot_dims(layout: str) -> tuple[int, int]:
+    if layout == "single":
+        return CANVAS_W, CANVAS_H
+    if DEVICE_ORIENTATION == "landscape":
+        return CANVAS_W // 2, CANVAS_H
+    return CANVAS_W, CANVAS_H // 2
+
+
+def _labels_for(asset: dict) -> list[str]:
+    labels = _asset_names(asset)
+    year = _get_year(asset)
+    if year:
+        labels.append(year)
+    return labels
+
+
+def _compose_prefitted(fitted: list[Image.Image], layout: str, assets: list[dict]) -> Image.Image:
     canvas = Image.new("RGB", (CANVAS_W, CANVAS_H), (255, 255, 255))
+    slot_w, slot_h = _slot_dims(layout)
 
     if layout == "single":
-        assert len(sources) == 1 and len(assets) == 1
-        canvas.paste(_fit_to_slot(sources[0], assets[0]["id"], CANVAS_W, CANVAS_H), (0, 0))
-
-        label_elements = _asset_names(assets[0])
-        year = _get_year(assets[0])
-        if year:
-            label_elements.append(year)
-
-        _draw_name_label(canvas, label_elements, 0, 0, CANVAS_W, CANVAS_H)
+        assert len(fitted) == 1 and len(assets) == 1
+        canvas.paste(fitted[0], (0, 0))
+        _draw_name_label(canvas, _labels_for(assets[0]), 0, 0, CANVAS_W, CANVAS_H)
         return canvas
 
-    assert layout == "duo" and len(sources) == 2 and len(assets) == 2
+    assert layout == "duo" and len(fitted) == 2 and len(assets) == 2
     if DEVICE_ORIENTATION == "landscape":
-        slot_w, slot_h = CANVAS_W // 2, CANVAS_H
-        canvas.paste(_fit_to_slot(sources[0], assets[0]["id"], slot_w, slot_h), (0, 0))
-        canvas.paste(_fit_to_slot(sources[1], assets[1]["id"], slot_w, slot_h), (slot_w, 0))
-
-        labels_0 = _asset_names(assets[0])
-        year_0 = _get_year(assets[0])
-        if year_0:
-            labels_0.append(year_0)
-
-        labels_1 = _asset_names(assets[1])
-        year_1 = _get_year(assets[1])
-        if year_1:
-            labels_1.append(year_1)
-
-        _draw_name_label(canvas, labels_0, 0, 0, slot_w, slot_h)
-        _draw_name_label(canvas, labels_1, slot_w, 0, slot_w, slot_h)
+        canvas.paste(fitted[0], (0, 0))
+        canvas.paste(fitted[1], (slot_w, 0))
+        _draw_name_label(canvas, _labels_for(assets[0]), 0, 0, slot_w, slot_h)
+        _draw_name_label(canvas, _labels_for(assets[1]), slot_w, 0, slot_w, slot_h)
     else:
-        slot_w, slot_h = CANVAS_W, CANVAS_H // 2
-        canvas.paste(_fit_to_slot(sources[0], assets[0]["id"], slot_w, slot_h), (0, 0))
-        canvas.paste(_fit_to_slot(sources[1], assets[1]["id"], slot_w, slot_h), (0, slot_h))
-
-        labels_0 = _asset_names(assets[0])
-        year_0 = _get_year(assets[0])
-        if year_0:
-            labels_0.append(year_0)
-
-        labels_1 = _asset_names(assets[1])
-        year_1 = _get_year(assets[1])
-        if year_1:
-            labels_1.append(year_1)
-
-        _draw_name_label(canvas, labels_0, 0, 0, slot_w, slot_h)
-        _draw_name_label(canvas, labels_1, 0, slot_h, slot_w, slot_h)
-
+        canvas.paste(fitted[0], (0, 0))
+        canvas.paste(fitted[1], (0, slot_h))
+        _draw_name_label(canvas, _labels_for(assets[0]), 0, 0, slot_w, slot_h)
+        _draw_name_label(canvas, _labels_for(assets[1]), 0, slot_h, slot_w, slot_h)
     return canvas
+
+
+def _compose_canvas(sources: list[Image.Image], layout: str, assets: list[dict]) -> Image.Image:
+    slot_w, slot_h = _slot_dims(layout)
+    fitted = [_fit_to_slot(s, a["id"], slot_w, slot_h)[0] for s, a in zip(sources, assets)]
+    return _compose_prefitted(fitted, layout, assets)
 
 
 def _rotate_final_canvas(canvas: Image.Image) -> Image.Image:
@@ -743,8 +755,9 @@ def _build_frame() -> tuple[str, str, Image.Image]:
     shape = DUO_SHAPE if layout == "duo" else SINGLE_SHAPE
     needed = 2 if layout == "duo" else 1
     batch_size = RANKING_BATCH * needed
+    slot_w, slot_h = _slot_dims(layout)
 
-    # 1. Gather + score candidate source images (pre-composition)
+    # 1. Gather + fit + score candidates (score is on the cropped image)
     scored: list[tuple[float, dict, Image.Image]] = []
     seen_ids: set[str] = set()
     for i in range(batch_size):
@@ -756,13 +769,31 @@ def _build_frame() -> tuple[str, str, Image.Image]:
         seen_ids.add(asset["id"])
         try:
             source = _normalize_source(_fetch_image(asset["id"]))
-            score = _composite_score(source)
+            fitted, retention = _fit_to_slot(source, asset["id"], slot_w, slot_h)
         except Exception as e:
-            log.warning("candidate %d: fetch/score failed: %s", i + 1, e)
+            log.warning("candidate %d: fetch/fit failed: %s", i + 1, e)
             continue
-        log.info("candidate %d/%d: score=%.4f asset=%s (%s)", i + 1, batch_size, score, asset["id"],
-                 asset.get("originalFileName", "?"))
-        scored.append((score, asset, source))
+
+        if CROP_MODE == "smart" and retention < MIN_CROP_RETENTION:
+            log.info(
+                "candidate %d/%d: REJECTED retention=%.1f%% < %.1f%% asset=%s (%s)",
+                i + 1, batch_size, retention * 100, MIN_CROP_RETENTION * 100,
+                asset["id"], asset.get("originalFileName", "?"),
+            )
+            continue
+
+        try:
+            score = _composite_score(fitted)
+        except Exception as e:
+            log.warning("candidate %d: score failed: %s", i + 1, e)
+            continue
+
+        log.info(
+            "candidate %d/%d: score=%.4f retention=%.1f%% asset=%s (%s)",
+            i + 1, batch_size, score, retention * 100,
+            asset["id"], asset.get("originalFileName", "?"),
+        )
+        scored.append((score, asset, fitted))
 
     # 2. Handle insufficient candidates
     if len(scored) < needed:
@@ -776,15 +807,15 @@ def _build_frame() -> tuple[str, str, Image.Image]:
         canvas = _rotate_final_canvas(_compose_canvas([source], "single", [asset]))
         return asset["id"], "single", canvas
 
-    # 3. Take top-N by score
+    # 3. Take top-N by score; skip re-cropping since candidates are already fitted
     scored.sort(key=lambda x: x[0], reverse=True)
     chosen = scored[:needed]
     log.info("selected top %d: %s", needed, [(f"{s:.4f}", a["id"]) for s, a, _ in chosen])
 
     assets = [c[1] for c in chosen]
-    sources = [c[2] for c in chosen]
+    fitted_sources = [c[2] for c in chosen]
 
-    canvas = _rotate_final_canvas(_compose_canvas(sources, layout, assets))
+    canvas = _rotate_final_canvas(_compose_prefitted(fitted_sources, layout, assets))
     return "+".join(a["id"] for a in assets), layout, canvas
 
 
