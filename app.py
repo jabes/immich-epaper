@@ -718,51 +718,57 @@ def _build_frame() -> tuple[str, str, Image.Image]:
         else:
             assets = [_pick_asset(SINGLE_SHAPE)]
 
-        sources = [_fetch_image(a["id"]) for a in assets]
-        sources = [_normalize_source(s) for s in sources]
+        sources = [_normalize_source(_fetch_image(a["id"])) for a in assets]
         canvas = _compose_canvas(sources, layout, assets)
         canvas = _rotate_final_canvas(canvas)
         return "+".join(a["id"] for a in assets), layout, canvas
 
-    candidates = []
-    for i in range(RANKING_BATCH):
+    shape = DUO_SHAPE if layout == "duo" else SINGLE_SHAPE
+    needed = 2 if layout == "duo" else 1
+    batch_size = RANKING_BATCH * needed
+
+    # 1. Gather + score candidate source images (pre-composition)
+    scored: list[tuple[float, dict, Image.Image]] = []
+    seen_ids: set[str] = set()
+    for i in range(batch_size):
         try:
-            if layout == "duo":
-                a1 = _pick_asset(DUO_SHAPE)
-                try:
-                    a2 = _pick_asset(DUO_SHAPE, exclude_ids={a1["id"]})
-                except RuntimeError:
-                    log.warning("candidate %d: duo failed, skipping", i + 1)
-                    continue
-                assets = [a1, a2]
-            else:
-                assets = [_pick_asset(SINGLE_SHAPE)]
-
-            sources = [_fetch_image(a["id"]) for a in assets]
-            canvas = _compose_canvas([_normalize_source(s) for s in sources], layout, assets)
-            canvas = _rotate_final_canvas(canvas)
-            score = _composite_score(canvas)
-
-            log.info("candidate %d: score=%.4f (assets: %s)", i + 1, score, [a["id"] for a in assets])
-            candidates.append((score, assets, canvas))
+            asset = _pick_asset(shape, exclude_ids=seen_ids)
+        except RuntimeError as e:
+            log.warning("candidate %d: pick failed (%s)", i + 1, e)
+            break
+        seen_ids.add(asset["id"])
+        try:
+            source = _normalize_source(_fetch_image(asset["id"]))
+            score = _composite_score(source)
         except Exception as e:
-            log.warning("candidate %d generation failed: %s", i + 1, e)
+            log.warning("candidate %d: fetch/score failed: %s", i + 1, e)
             continue
+        log.info("candidate %d/%d: score=%.4f asset=%s (%s)", i + 1, batch_size, score, asset["id"],
+                 asset.get("originalFileName", "?"))
+        scored.append((score, asset, source))
 
-    if not candidates:
-        log.error("No candidates could be generated; falling back to random single pick")
-        assets = [_pick_asset(SINGLE_SHAPE)]
-        sources = [_fetch_image(a["id"]) for a in assets]
-        canvas = _compose_canvas([_normalize_source(s) for s in sources], "single", assets)
-        canvas = _rotate_final_canvas(canvas)
-        return assets[0]["id"], "single", canvas
+    # 2. Handle insufficient candidates
+    if len(scored) < needed:
+        if layout == "duo" and len(scored) >= 1:
+            log.warning("duo needs 2 candidates, only got %d; falling back to single", len(scored))
+            layout = "single"
+        if layout == "single" and not scored:
+            log.error("no candidates scored; falling back to random single pick")
+        asset = _pick_asset(SINGLE_SHAPE)
+        source = _normalize_source(_fetch_image(asset["id"]))
+        canvas = _rotate_final_canvas(_compose_canvas([source], "single", [asset]))
+        return asset["id"], "single", canvas
 
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    best_score, best_assets, best_canvas = candidates[0]
-    log.info("best candidate score=%.4f, assets=%s", best_score, [a["id"] for a in best_assets])
+    # 3. Take top-N by score
+    scored.sort(key=lambda x: x[0], reverse=True)
+    chosen = scored[:needed]
+    log.info("selected top %d: %s", needed, [(f"{s:.4f}", a["id"]) for s, a, _ in chosen])
 
-    return "+".join(a["id"] for a in best_assets), layout, best_canvas
+    assets = [c[1] for c in chosen]
+    sources = [c[2] for c in chosen]
 
+    canvas = _rotate_final_canvas(_compose_canvas(sources, layout, assets))
+    return "+".join(a["id"] for a in assets), layout, canvas
 
 # ---------------------------------------------------------------------------
 # Application Server & Pre-warm Startup Process
