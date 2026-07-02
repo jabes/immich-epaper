@@ -254,7 +254,22 @@ def _add_no_store_headers(headers: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Immich API Client & Validation Handlers
 # ---------------------------------------------------------------------------
+def _is_jpeg(asset: dict) -> bool:
+    # Check mimeType if available in the API response
+    mime = asset.get("mimeType", "").lower()
+    if mime:
+        return mime in ("image/jpeg", "image/jpg")
+    # Fallback to checking the file name extension
+    filename = asset.get("originalFileName", "").lower()
+    path = asset.get("originalPath", "").lower()
+    return filename.endswith((".jpg", ".jpeg")) or path.endswith((".jpg", ".jpeg"))
+
+
 def _is_asset_allowed(asset: dict) -> bool:
+    # 1. Enforce strict JPEG check first
+    if not _is_jpeg(asset):
+        return False
+    # 2. Existing people exclusion check
     if not EXCLUDE_PEOPLE:
         return True
     for p in asset.get("people", []):
